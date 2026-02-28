@@ -317,6 +317,17 @@ Consuming `Microsoft-Windows-Threat-Intelligence` events requires running as PPL
 
 On x64 Windows, **PatchGuard** periodically verifies the integrity of critical kernel data structures including the ETW provider and session tables. Modifying `nt!EtwpLoggerContext` or the ETW GUID hash table will eventually trigger a `CRITICAL_STRUCTURE_CORRUPTION` (0x109) BSoD. This prevents persistent kernel-level ETW manipulation.
 
+## Summary
+
+ETW is far more than a logging system — it is a fundamental pillar of Windows observability and security telemetry. Understanding it at the structural level, from the `ETW_REG_ENTRY` all the way to the consumer callback, is essential for both red teamers aiming to operate with precision and defenders building robust detection pipelines.
+
+The key takeaways:
+
+- ETW's early-exit optimization (the `EnableMask` check) is the single most efficient place to blind a provider without patching code.
+- ETW-TI is the hardest tier to bypass — it requires ring-0 or PPL, and PatchGuard adds a significant detection risk for persistent modifications.
+- Metadata poisoning (PPID spoof, argument tamper) is often more practical than trying to disable ETW entirely.
+- Defenders should monitor `EventsLost`, instrument canary events, and leverage ETW-TI consumers running as PPL.
+
 ### VBS & Secure Mode
 
 Windows 11 and recent Server builds extend ETW protections through **Virtualization-Based Security (VBS)** and **ETW Secure Mode**, which move certain critical ETW writes into the secure world and make them resistant to even kernel-mode tampering. Combined with Secure Boot, these controls significantly raise the bar for ETW manipulation on modern hardware.
