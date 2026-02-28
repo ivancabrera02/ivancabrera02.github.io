@@ -205,3 +205,118 @@ typedef struct _EVENT_HEADER {
 
 The following section will discuss how ETW providers can be used offensively in real-world exercises, or how we can study the telemetry of EDR products, since most of them are based on this technology.
 
+
+
+## ETW Usermode Evasion Techniques
+
+ETW evasion techniques range from patching a single byte in user-mode to sophisticated kernel manipulation. They are best categorized by the layer at which they operate and the required access level.
+
+### 01 — Patching `EtwEventWrite` in `ntdll.dll`
+
+**Scope:** Per-process | **Detection risk:** Medium
+
+The simplest technique: patch `EtwEventWrite` (or `EtwEventWriteFull`) in `ntdll.dll` within your own process to immediately return `STATUS_SUCCESS` without doing anything. Since these are user-mode functions in memory you own, you can remove write protection and overwrite the prologue.
+
+```c
+// Write a "return STATUS_SUCCESS" at the start of EtwEventWrite
+PVOID pEtw = GetProcAddress(GetModuleHandleA("ntdll.dll"), "EtwEventWrite");
+
+DWORD oldProtect;
+VirtualProtect(pEtw, 6, PAGE_EXECUTE_READWRITE, &oldProtect);
+
+// Patch: mov eax, 0 ; ret
+BYTE patch[] = { 0xB8, 0x00, 0x00, 0x00, 0x00, 0xC3 };
+memcpy(pEtw, patch, sizeof(patch));
+
+VirtualProtect(pEtw, 6, oldProtect, &oldProtect);
+```
+
+**Detection:** ETW consumer watchdogs, AMSI/ETW integrity checks, and hardware breakpoints from a monitoring thread will catch this. Modern EDRs scan ntdll exports for prologue modifications.
+
+---
+
+### 02 — Zeroing the `EnableMask` in `ETW_REG_ENTRY`
+
+**Scope:** Per-provider, per-process | **Detection risk:** Low-Medium
+
+More surgical: zero out the `EnableMask` field in the `ETW_REG_ENTRY` for a specific provider. The `REGHANDLE` returned by `EtwRegister()` encodes a pointer to the provider's `ETW_REG_ENTRY`. Setting `EnableMask = 0` causes all pre-write checks to fail, silently dropping all events from that provider without patching any code.
+
+```c
+// REGHANDLE encodes the ETW_REG_ENTRY pointer
+// (verify encoding for your target build via EtwpWriteUserEvent analysis)
+REGHANDLE hReg;
+EtwEventRegister(&ProviderGuid, NULL, NULL, &hReg);
+
+PETW_REG_ENTRY pEntry = (PETW_REG_ENTRY)(hReg & ~0xFFFF);
+
+// Zero the enable state — events from this provider are silently dropped
+pEntry->EnableMask  = 0;
+pEntry->EnableLevel = 0;
+```
+
+**Detection:** No code is patched, making this harder to spot. However, if a defender calls `EtwGetTraceEnableFlags()` or monitors the GUID entry they may notice the mismatch between the session state and the registration entry.
+
+---
+
+### 03 — CLR-Specific ETW Patching
+
+**Scope:** .NET providers | **Detection risk:** Medium
+
+The `Microsoft-Windows-DotNETRuntime` provider fires events when assemblies are loaded via the standard CLR loader. Patching `EtwEventWrite` inside the CLR DLLs (`clr.dll` / `coreclr.dll`) specifically kills CLR telemetry without disturbing the main ntdll write path, making it less likely to trigger broad-scope integrity checks.
+
+```c
+HMODULE hClr = GetModuleHandleA("clr.dll");
+if (!hClr) hClr = GetModuleHandleA("coreclr.dll");
+
+// EtwEventWrite inside the CLR is distinct from ntdll's export.
+// Locate via IAT walk or pattern scan, then patch.
+PVOID pCLREtw = FindEtwWriteInModule(hClr);
+PatchReturnZero(pCLREtw);
+```
+
+**Detection:** CLR-specific integrity monitoring. Some EDRs instrument `clr.dll` independently and will notice.
+
+---
+
+### 04 — Session Starvation (Buffer Flooding)
+
+**Scope:** All providers in a session | **Detection risk:** High
+
+Each ETW session has a finite buffer pool. By emitting events faster than the logger thread can flush them, you cause buffers to fill up. New events are **silently dropped** and the `EventsLost` counter in `ETW_LOGGER_CONTEXT` increments. This degrades the fidelity of all providers sharing that session. Noisy and detectable, but can create meaningful gaps in chaotic environments.
+
+```c
+// Flood a session by emitting at maximum rate from a custom provider
+while (1) {
+    EtwEventWrite(hReg, &EventDescriptor, 0, NULL);
+}
+```
+
+**Detection:** Any consumer monitoring `EventsLost` via `QueryTrace()` will alert immediately when the counter spikes. Not recommended for stealth operations.
+
+## Detection & Hardening
+
+From a defender's perspective, ETW evasion attempts leave signatures of their own.
+
+### Detecting ntdll / CLR Patching
+
+Periodically scan the first bytes of `EtwEventWrite`, `EtwEventWriteFull`, and related exports in loaded modules against known-good byte patterns from the on-disk PE or a clean in-memory copy. A mismatch indicates patching. Hardware breakpoints placed on these functions from a monitoring thread can also catch execution of patched code in real-time.
+
+### Monitoring `EventsLost`
+
+Regularly poll the `EventsLost` counter in your session via `QueryTrace()` and alert when it exceeds a configured threshold. Buffer starvation attacks will drive this counter up rapidly and consistently.
+
+### Canary Events
+
+Emit synthetic "canary" events from a known provider at a fixed interval. If the consumer stops receiving them, it's a strong signal that the provider or session has been tampered with.
+
+### ETW-TI & Protected Process Consumers
+
+Consuming `Microsoft-Windows-Threat-Intelligence` events requires running as PPL or higher — enforced at the kernel session level and not bypassable from user mode. Vendors building EDR products should leverage this for all critical telemetry paths.
+
+### Kernel Patch Guard (KPP)
+
+On x64 Windows, **PatchGuard** periodically verifies the integrity of critical kernel data structures including the ETW provider and session tables. Modifying `nt!EtwpLoggerContext` or the ETW GUID hash table will eventually trigger a `CRITICAL_STRUCTURE_CORRUPTION` (0x109) BSoD. This prevents persistent kernel-level ETW manipulation.
+
+### VBS & Secure Mode
+
+Windows 11 and recent Server builds extend ETW protections through **Virtualization-Based Security (VBS)** and **ETW Secure Mode**, which move certain critical ETW writes into the secure world and make them resistant to even kernel-mode tampering. Combined with Secure Boot, these controls significantly raise the bar for ETW manipulation on modern hardware.
