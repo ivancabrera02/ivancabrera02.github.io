@@ -9,10 +9,199 @@ tags:
 
 ## What is ETW?
 
-**Event Tracing for Windows (ETW)** is a high-performance, kernel-level tracing mechanism built into Windows that allows both user-mode and kernel-mode components to log structured events. Introduced with Windows 2000 and massively expanded in later releases, ETW is today the backbone of Windows diagnostics, performance analysis, and — crucially for us — security monitoring.
+Event Tracing for Windows (ETW) is a high-performance, kernel-level tracing mechanism built into Windows that allows both user-mode and kernel-mode components to log structured events. Introduced with Windows 2000 and massively expanded in later releases, ETW is today the backbone of Windows diagnostics, performance analysis, and crucially for us security monitoring.
 
-Unlike traditional logging systems, ETW is designed for **minimal overhead**. Events are written to in-memory circular per-CPU buffers and only flushed to disk or delivered to consumers when necessary. Microsoft itself uses ETW internally for the Windows Performance Recorder (WPR), Windows Performance Analyzer (WPA), Process Monitor, and many components of Windows Defender / Microsoft Defender for Endpoint (MDE).
+Unlike traditional logging systems, ETW is designed for minimal overhead. Events are written to in-memory circular per-CPU buffers and only flushed to disk or delivered to consumers when necessary. Microsoft itself uses ETW internally for the Windows Performance Recorder (WPR), Windows Performance Analyzer (WPA), Process Monitor, and many components of Windows Defender / Microsoft Defender for Endpoint (MDE).
 
-From a security standpoint, ETW is a double-edged sword: for defenders it is a rich telemetry goldmine; for attackers it is a surveillance system that must be understood, blinded, or bypassed to stay under the radar.
+From a security standpoint, ETW is a double-edged sword: for defenders it is a rich telemetry goldmine, for attackers it is a surveillance system that must be understood, blinded, or bypassed to stay under the radar.
 
 > ETW currently ships with **1,000+ built-in providers** in Windows 10/11, covering everything from network activity and process creation to AMSI scan results, CLR events, and kernel object access.
+
+Why ETW was CreatedPermalink
+In earlier versions of Windows, such as NT4, it was challenging to diagnose performance issues and understand system behavior due to limited visibility into what was happening within the system. ETW was designed to fill this gap by offering a high-performance, low-overhead tracing solution that can handle thousands of events per second without significantly impacting system performance.
+
+### Key Features of ETW
+
+* Low Overhead and High Performance:
+ETW is designed to be efficient, ensuring that even with a high volume of events, the performance impact on the system is negligible.
+* Rich Semantics and Schema:
+ETW provides more than just numeric data; it includes detailed event properties and types, offering a richer set of data for analysis.
+Events in ETW come with a schema that defines the structure and types of data they carry, making it easier to interpret the events.
+* System-Wide Coverage:
+ETW is not limited to specific processes; it captures events from the entire system, ensuring a comprehensive view of system activity.
+This system-wide approach is crucial for diagnosing issues that may span multiple processes or system components.
+
+### Main Components of ETW
+There are four main components involved in ETW based on Microsoft documentation:
+
+* Provider
+* Session
+* Controller
+* Consumer
+
+Each of these components serves a specific role in event-tracing sessions.
+
+FOTO
+
+#### Providers
+
+A **provider** is any component — kernel driver, user-mode DLL, or application — that registers with ETW and emits events. Providers are identified by a **GUID** and described via a manifest (XML) or MOF file. Registration happens via `EtwRegister()` (user mode) or `EtwRegisterProvider()` (kernel mode). Providers are completely dormant until a session explicitly enables them.
+
+#### Sessions
+
+A **tracing session** is the conduit between providers and consumers. Sessions are created via `StartTrace()` / `EnableTraceEx2()` and configure which providers to listen to, at what verbosity level (keywords + level), and where to write data (file, real-time, or circular buffer). The kernel supports a maximum of **64 simultaneous ETW sessions** (Windows Vista+), with private logger sessions added in Windows 8+.
+
+#### Consumers
+
+Consumers read events either in real-time from a live session or post-mortem from an `.etl` file. The `ProcessTrace()` API drives event delivery to registered callbacks (`EventRecordCallback`). Tools like **logman**, **xperf**, **tracerpt**, and **WPA** all act as consumers.
+
+#### The Buffer Mechanism
+
+When a provider writes an event, ETW does not immediately flush to disk. Instead, events land in **per-CPU memory buffers** managed by the kernel. The size and count of these buffers are configurable per session, and the kernel flushes them based on a timer or when they fill up. This design achieves near-zero overhead for disabled providers and very low overhead for enabled ones.
+
+```c
+// Simplified provider write path
+EtwWrite()           // user-mode wrapper
+  → NtTraceEvent()   // syscall into kernel
+    → EtwpWriteUserEvent()
+      // 1. Find matching enabled sessions for this provider+keyword
+      // 2. Reserve space in per-CPU buffer (lock-free CAS)
+      // 3. Copy event header + payload into buffer
+      // 4. Signal flush if buffer threshold reached
+```
+
+#### Controllers
+
+Controllers are the components that define and manage trace sessions, which record events generated by providers and deliver them to event consumers. The responsibilities of a controller include, among other tasks:
+
+* Starting and stopping sessions
+* Enabling or disabling providers associated with a session
+* Managing the size of the event buffer pool
+* 
+A single application might contain both controller and consumer code; alternatively, the controller can be a separate application entirely, such as the logman utility.
+
+Controllers create trace sessions using the sechost!StartTrace() API and configure them with sechost!ControlTrace(), advapi!EnableTraceEx(), or sechost!EnableTraceEx2()
+
+## ETW at a Kernel-Level
+
+This is where things get genuinely interesting. ETW's kernel implementation lives in `ntoskrnl.exe` and is managed through a set of undocumented (but reversible) structures. Understanding these is a prerequisite for any meaningful ETW manipulation. All offsets below are verified against Windows 10 22H2 / Windows 11 23H2 verify before using on other builds.
+
+FOTO
+
+Next, we will look at the main kernel structures related to this technology:
+
+### `_ETW_REG_ENTRY` — Provider Registration
+
+When a provider registers via `EtwRegister()`, the kernel allocates an `_ETW_REG_ENTRY` representing the registered provider instance. The returned `REGHANDLE` encodes a pointer to this structure and is used for all subsequent write operations.
+
+```c
+typedef struct _ETW_REG_ENTRY {
+  /*+0x000*/ LIST_ENTRY              RegList;           // linked into global provider list
+  /*+0x010*/ GUID                    ProviderId;        // provider GUID
+  /*+0x020*/ PEPROCESS               Process;           // owning process (NULL = kernel)
+  /*+0x028*/ ULONG                   Index;             // index into provider table
+  /*+0x02C*/ ULONG                   Flags;             // ETW_REG_FLAG_*
+  /*+0x030*/ ULONGLONG               EnableMask;        // ← CRITICAL: bitmask of enabled keywords
+  /*+0x038*/ UCHAR                   EnableLevel;       // ← max verbosity level enabled
+  /*+0x039*/ UCHAR                   EnabledByAny;      // non-zero if ANY session enabled this
+  /*+0x040*/ PETW_GUID_ENTRY         GuidEntry;         // pointer to shared GUID info
+  /*+0x048*/ PETW_LOGGER_CONTEXT     SessionCtx;        // ptr to session context if active
+  /*+0x050*/ PETWENABLECALLBACK      EnableCallback;    // optional callback on enable/disable
+  /*+0x058*/ PVOID                   CallbackContext;   // context passed to callback
+} ETW_REG_ENTRY, *PETW_REG_ENTRY;
+```
+
+> **Key insight:** `EnableMask` and `EnableLevel` are checked at the very beginning of `EtwpWriteUserEvent()`. If `EnableMask == 0` or no session has enabled the provider, the write path is short-circuited immediately at near-zero cost. **This is the field attackers target to blind ETW providers.**
+
+### `_ETW_GUID_ENTRY` — Per-GUID State
+
+The kernel maintains a global hash table of `_ETW_GUID_ENTRY` structures, one per registered provider GUID. This aggregates the state of all registrations for the same GUID (a single GUID can be registered by multiple processes simultaneously).
+
+```c
+typedef struct _ETW_GUID_ENTRY {
+  /*+0x000*/ LIST_ENTRY              GuidList;          // hash table chain
+  /*+0x010*/ LONG                    RefCount;
+  /*+0x014*/ GUID                    Guid;
+  /*+0x024*/ LIST_ENTRY              RegListHead;       // list of all ETW_REG_ENTRYs for this GUID
+  /*+0x034*/ ULONGLONG               EnableMask;        // aggregate keyword mask
+  /*+0x03C*/ UCHAR                   EnableLevel;
+  /*+0x040*/ ETW_SESSION_MASK        SessionMask;       // bitmask of sessions listening to this GUID
+  /*+0x048*/ SECURITY_DESCRIPTOR    *SecurityDescriptor;
+} ETW_GUID_ENTRY;
+```
+
+### `_ETW_LOGGER_CONTEXT` — Session State
+
+Each active ETW session is represented in the kernel by an `_ETW_LOGGER_CONTEXT` (also called `_WMI_LOGGER_CONTEXT` in older references). This is the most important structure for session-level manipulation.
+
+```c
+typedef struct _ETW_LOGGER_CONTEXT {  // ~0x1000+ bytes
+  /*+0x000*/ ULONG                    LoggerId;         // session ID (0-63)
+  /*+0x004*/ ULONG                    BufferSize;
+  /*+0x008*/ ULONG                    MaximumFileSize;
+  /*+0x010*/ LARGE_INTEGER            StartTime;
+  /*+0x018*/ UNICODE_STRING           LogFileName;
+  /*+0x028*/ UNICODE_STRING           LoggerName;       // e.g. "NT Kernel Logger"
+  /*+0x050*/ ULONG                    LoggingMode;      // EVENT_TRACE_*_MODE flags
+  /*+0x054*/ ULONG                    LoggerStatus;     // STATUS_* or 0 = active
+  /*+0x058*/ PETHREAD                 LoggerThread;     // kernel thread processing buffers
+  /*+0x060*/ PLIST_ENTRY              BufferQueue;      // per-CPU buffer list
+  /*+0x068*/ ULONG                    NumberOfBuffers;
+  /*+0x06C*/ ULONG                    MinimumBuffers;
+  /*+0x070*/ ULONG                    MaximumBuffers;
+  /*+0x080*/ ULONG                    EventsLost;       // ← incremented when buffer full
+  /*+0x090*/ GUID                     InstanceGuid;
+  /*+0x0A0*/ SECURITY_DESCRIPTOR     *SecurityDescriptor;
+  /*+0x0B0*/ ULONG                    FilterDescCount;
+  /*+0x0B4*/ PEVENT_FILTER_DESCRIPTOR FilterDesc;
+  /*+0x200*/ ETW_BUFFER_CONTEXT       BufferContext[64]; // per-CPU
+} ETW_LOGGER_CONTEXT;
+```
+
+### `_WMI_BUFFER_HEADER` — Per-CPU Buffer
+
+The actual event data lives in these buffers. Each CPU owns its own to minimize lock contention. The header precedes raw event data in memory.
+
+```c
+typedef struct _WMI_BUFFER_HEADER {
+  /*+0x000*/ WMI_BUFFER_STATE        State;             // Free, Dirty, Flush, Placeholder
+  /*+0x004*/ ULONG                   Offset;            // current write offset
+  /*+0x008*/ ULONG                   BufferSize;
+  /*+0x00C*/ ULONG                   SavedOffset;
+  /*+0x010*/ ULONG                   CurrentOffset;
+  /*+0x014*/ ULONG                   ReferenceCount;
+  /*+0x018*/ LARGE_INTEGER           TimeStamp;
+  /*+0x020*/ LONGLONG                SequenceNumber;
+  /*+0x028*/ ULONG                   LoggerId;
+  /*+0x02C*/ ETW_BUFFER_CONTEXT      Cpu;               // which CPU owns this buffer
+  /*+0x030*/ LIST_ENTRY              Entry;
+} WMI_BUFFER_HEADER;
+// Immediately follows: raw event data up to (BufferSize - sizeof(header))
+```
+
+### `EVENT_HEADER` — On-Wire Event Format
+
+Every event written to a buffer is preceded by a standard `EVENT_HEADER` (for manifest-based providers). This carries metadata about the event.
+
+```c
+typedef struct _EVENT_HEADER {
+  /*+0x000*/ USHORT                  Size;              // total size including header
+  /*+0x002*/ USHORT                  HeaderType;
+  /*+0x004*/ USHORT                  Flags;             // EVENT_HEADER_FLAG_* (64bit, classic…)
+  /*+0x006*/ USHORT                  EventProperty;     // e.g. EVENT_HEADER_PROPERTY_XML
+  /*+0x008*/ ULONG                   ThreadId;
+  /*+0x00C*/ ULONG                   ProcessId;
+  /*+0x010*/ LARGE_INTEGER           TimeStamp;
+  /*+0x018*/ GUID                    ProviderId;
+  /*+0x028*/ EVENT_DESCRIPTOR        EventDescriptor;   // Id, Version, Channel, Level, Opcode, Task, Keyword
+  /*+0x030*/ ETW_ACTIVITY_ID         ActivityId;        // for correlating related events
+} EVENT_HEADER;
+// Immediately follows: provider-specific payload data
+```
+
+> Deep dive: The kernel-mode ETW provider table is anchored at `nt!EtwpGuidHashTable` a hash table of `ETW_GUID_ENTRY` pointers indexed by the low bits of the provider GUID. The session context array lives at `nt!EtwpLoggerContext`, an array of 64 `ETW_LOGGER_CONTEXT*` pointers. Both are prime targets for kernel-level manipulation.
+
+## Interesting ETW Providers: Offensive Perspective
+
+The following section will discuss how ETW providers can be used offensively in real-world exercises, or how we can study the telemetry of EDR products, since most of them are based on this technology.
+
