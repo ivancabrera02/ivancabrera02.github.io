@@ -1,10 +1,14 @@
-# Lateral Movement from On-Premises Active Directory to Entra ID
-
-> **Estimated reading time:** ~30 minutes  
-> **Audience:** Red teamers, penetration testers, and security researchers with intermediate Active Directory and Azure/Entra ID knowledge.  
-> **Tags:** `Entra ID`, `Active Directory`, `Hybrid Identity`, `Red Team`, `PRT`, `Pass-the-PRT`, `WANBAN`, `Token Theft`
-
 ---
+title: "Lateral Movement from On-Premises Active Directory to Entra ID"
+categories:
+  - Blog
+tags:
+  - Windows
+  - Azure
+  - Red Team
+---
+
+# Lateral Movement from On-Premises Active Directory to Entra ID
 
 ## Table of Contents
 
