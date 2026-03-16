@@ -7,8 +7,6 @@ tags:
   - Red Team
 ---
 
-# Using ETW for Offensive Security
-
 ## Table of Contents
 
 1. [Introduction](#introduction)
