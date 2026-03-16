@@ -24,8 +24,6 @@ tags:
    - [Subscribing to a Provider Programmatically](#subscribing-to-a-provider-programmatically)
 4. [Offensive Uses of ETW](#offensive-uses-of-etw)
    - [SMB Provider: Capturing NTLMv2 Hashes](#smb-provider-capturing-ntlmv2-hashes)
-   - [LDAP Provider: Reconnaissance Detection and Evasion](#ldap-provider-reconnaissance-detection-and-evasion)
-   - [DNS Provider: Tracking Lateral Movement and C2 Beaconing](#dns-provider-tracking-lateral-movement-and-c2-beaconing)
    - [PowerShell ETW: Script Block Logging Internals](#powershell-etw-script-block-logging-internals)
    - [WMI Provider: Persistence and Lateral Movement Awareness](#wmi-provider-persistence-and-lateral-movement-awareness)
    - [Process and Thread Providers: Injection Detection and Evasion](#process-and-thread-providers-injection-detection-and-evasion)
@@ -62,7 +60,7 @@ ETW is built around three distinct roles that interact with the tracing infrastr
 
 **Consumers** are processes that read the event data. They can either read from a live session in real time using `OpenTrace` and `ProcessTrace`, or read from a log file (`.etl`) after the fact. The consumer registers an `EVENT_RECORD_CALLBACK` function that is invoked for each matching event.
 
-FOTO ETW ARQUITECTURE
+![etw](../assets/images/etwarchitecture.png)
 
 ### How Events Flow Through the Kernel
 
@@ -119,13 +117,13 @@ The **Circular Kernel Context Logger (CKCL)** is a special session that runs in 
 
 ### Listing Providers on a Live System
 
-FOTO LOGMAN QUERY
-
 The quickest way to enumerate registered ETW providers on a live system is `logman`:
 
 ```cmd
 logman query providers
 ```
+
+![logman](../assets/images/logman.png)
 
 This queries `TdhEnumerateProviders` under the hood and lists every provider that has a registered manifest. For a more complete view including unregistered/TraceLogging providers currently active in running processes, you can use:
 
@@ -281,6 +279,8 @@ $source.Dynamic.All += { param($event)
 }
 $source.Process()
 ```
+
+![hash](../assets/images/etw4.png)
 
 This is a stealthy complement to traditional responder-style attacks: no new network traffic, no injected packets, just passive observation of the existing authentication stream.
 
