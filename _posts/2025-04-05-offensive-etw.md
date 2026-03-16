@@ -34,8 +34,6 @@ tags:
 7. [Defensive Recommendations](#defensive-recommendations)
 8. [Conclusion](#conclusion)
 
----
-
 ## Introduction
 
 Event Tracing for Windows (ETW) is one of the most powerful and least understood subsystems in the entire Windows operating system. Originally designed as a high-performance logging and diagnostics framework, ETW has quietly become one of the primary telemetry sources that every modern EDR (Endpoint Detection and Response) product depends on. It is the backbone behind Windows Defender, Microsoft Defender for Endpoint, Sysmon's kernel callbacks, and countless third-party security tools.
@@ -43,8 +41,6 @@ Event Tracing for Windows (ETW) is one of the most powerful and least understood
 For a red teamer or penetration tester, ETW is a double-edged sword. On one hand, it is the mechanism that will get your implant detected, your lateral movement flagged, and your persistence mechanisms burned. On the other hand, understanding ETW deeply allows you to consume its telemetry offensively capturing credential material, mapping network activity, and understanding exactly what defenders can and cannot see.
 
 This post covers ETW from the ground up: how it works internally at both the user and kernel level, which providers are interesting from an offensive standpoint, how to consume events programmatically, and a detailed timeline of every significant ETW bypass technique that has been publicly disclosed from patching `EtwEventWrite` in user space to manipulating kernel data structures directly.
-
----
 
 ## ETW Architecture and Internals
 
@@ -108,8 +104,6 @@ Two sessions deserve special mention:
 The **NT Kernel Logger** (`{9E814AAD-3204-11D2-9A82-006008A86939}`) is the primary kernel tracing session, capturing events from `Microsoft-Windows-Kernel-Process`, `Microsoft-Windows-Kernel-File`, `Microsoft-Windows-Kernel-Network`, and related providers. It is the source of process creation, image load, file I/O, and network events, the bread and butter of EDR telemetry.
 
 The **Circular Kernel Context Logger (CKCL)** is a special session that runs in kernel mode, with its buffers stored in non-paged pool. It is used internally by Windows and also feeds the ETW consumer architecture. Importantly, the CKCL is used by `WdBoot.sys` (Windows Defender's boot driver) to receive early boot telemetry before the full ETW stack is running.
-
----
 
 ## Enumerating and Working with Providers
 
@@ -223,8 +217,6 @@ int main() {
 
 This pattern start a session, enable a provider, open and process the trace — is the foundation for every offensive ETW consumer tool.
 
----
-
 ## Offensive Uses of ETW
 
 Now for the interesting part. ETW is not just a defensive telemetry mechanism  it is a rich source of structured, low-latency operational data that an attacker on a compromised host can consume to dramatically improve situational awareness, capture credential material, and map the environment.
@@ -233,58 +225,13 @@ The following sections detail the most interesting provider from an offensive st
 
 ### SMB Provider: Capturing NTLMv2 Hashes
 
-> 📷 *[Insert screenshot: ETW consumer showing NTLMv2 hash material from SMB authentication events]*
+**Provider:** `Microsoft-Windows-SMBServer` (`{D48CE617-33A2-4BC3-A5C7-11AA8D29FFFE}`)
 
-**Provider:** `Microsoft-Windows-SMBClient` (`{988C59C5-0A1C-45B6-A555-F2CA89273C41}`)  
-**Also relevant:** `Microsoft-Windows-SMBServer` (`{D48CE617-33A2-4BC3-A5C7-11AA8D29FFFE}`)
-
-The SMB client provider emits detailed events covering connection setup, authentication negotiation, and file operations. From an offensive perspective, the most valuable events are those surrounding NTLM authentication — specifically, events that expose the NTLM challenge-response material transiting through an SMB connection.
-
-When a Windows client authenticates to an SMB server using NTLM (whether real or an attacker-controlled responder), the ETW SMBClient provider fires events containing:
-
-- The target server name and IP
-- The username and domain being authenticated
-- The NTLM authentication flags
-- In some Windows versions, fragments of the authentication blob that include the NTLMv2 response itself
-
-The attack scenario is compelling: on a compromised host, run an ETW consumer subscribed to the SMB client provider. Then trigger NTLM authentications — either wait for organic ones from the user (e.g., they access a network share) or force them via common techniques like SCF files, UNC path injection in Office documents, or `net use`. The ETW events will surface the authentication activity with enough metadata to correlate with and complement standard responder captures.
-
-At a higher privilege level, subscribing to `Microsoft-Windows-SMBServer` on a host that acts as a file server can reveal every authentication attempt against it, including failed ones with partial hash material.
-
-Key event IDs to monitor in `Microsoft-Windows-SMBClient`:
-
-| Event ID | Description |
-|----------|-------------|
-| 30800 | Session setup (authentication initiation) |
-| 30803 | Logon success with authentication details |
-| 30804 | Logon failure (exposes username, target) |
-| 40001 | Connection initiated |
-| 40002 | Connection disconnected |
-
-```powershell
-# Quick PowerShell one-liner to subscribe and dump SMBClient auth events
-# Requires admin rights and the ETW session privileges
-$session = New-Object Microsoft.Diagnostics.Tracing.Session.TraceEventSession("SMBHarvest")
-$session.EnableProvider("Microsoft-Windows-SMBClient", 
-    [Microsoft.Diagnostics.Tracing.Session.TraceEventLevel]::Verbose, 
-    [ulong]::MaxValue)
-
-$source = $session.Source
-$source.Dynamic.All += { param($event)
-    if ($event.ID -in @(30800, 30803, 30804)) {
-        Write-Host "[SMB Auth] $($event.TimeStamp) User=$($event['UserName']) Target=$($event['ServerName'])"
-    }
-}
-$source.Process()
-```
+test
 
 ![hash](/assets/images/etw4.png)
 
 This is a stealthy complement to traditional responder-style attacks: no new network traffic, no injected packets, just passive observation of the existing authentication stream.
-
-**For red teamers, two implications:**
-
-First, SBL events travel the same ETW pathway as every other event — they are subject to the same bypass techniques described in the bypass timeline section. Patching the provider-sid
 
 ### Process and Thread Providers: Injection Detection and Evasion
 
@@ -332,13 +279,9 @@ This is useful for:
 - **Operator awareness:** Detect when incident responders log on (new logon events for unknown users) or when new scheduled tasks are created (4698) — potentially indicating defensive automation being deployed against you.
 - **Kerberos ticket events:** Events 4769 (Kerberoastable service ticket requests) and 4771 (Kerberos pre-auth failures) appear here in real time, giving you visibility into whether your Kerberoasting activity is generating noise.
 
----
-
 ## ETW Bypass Timeline: A History of Evasion
 
 One of the most fascinating aspects of ETW's security history is the arms race between researchers finding bypass techniques and Microsoft hardening the infrastructure. What follows is a comprehensive timeline of publicly disclosed ETW bypass methods, categorized by whether they operate in user mode or kernel mode.
-
----
 
 ### User-Mode Bypasses
 
@@ -350,8 +293,6 @@ The earliest ETW bypass techniques were conceptually simple: if a provider dereg
 
 **Impact:** Affected all user-mode providers including PowerShell's script block logging provider.  
 **Detection:** Correlation between process behavior and absence of expected ETW events.
-
----
 
 #### 2015 — `EtwEventWrite` Function Patching
 
@@ -392,8 +333,6 @@ VirtualProtect(etwAddr, (UIntPtr)1, oldProtect, out _);
 **Impact:** Completely silences all ETW events from the patched process. Killed PowerShell script block logging when applied before script execution.  
 **Detection:** Memory integrity checks on ntdll (comparing loaded image bytes to disk) this is now detected by Windows Defender's IUMFI (Image File Integrity) checks and most EDRs.
 
----
-
 #### 2016–2017 — Registration Handle NULL-ing
 
 Research by Adam Chester and others identified a cleaner approach: rather than patching the function itself, zero out the registration handle stored in the provider's registration structure. The `EtwEventWrite` fast path checks the registration handle early a null or invalid handle causes an immediate return with `STATUS_INVALID_HANDLE` before any kernel call.
@@ -413,8 +352,6 @@ By walking this linked list and zeroing the `RegHandle` field for target provide
 **Impact:** More stealthy than function patching, avoids modification of `.text` section pages.  
 **Detection:** Behavioral presence of code walking ntdll internal structures scanning for zeroed handles in provider registration linked lists.
 
----
-
 #### 2018 — Provider Keyword/Level Manipulation
 
 Rather than disabling providers outright, researchers demonstrated that the keyword and level fields of the provider registration structure can be manipulated to cause `EtwEventWrite` to skip the kernel transition entirely (due to the fast-path check against enabled keywords/levels).
@@ -423,8 +360,6 @@ If the registration reflects that no session is listening with matching keyword/
 
 **Impact:** Even more surgical can target specific event categories while leaving others operational, making the silence harder to notice against a baseline.  
 **Detection:** Comparing live registration structure fields against expected values registered in the manifest.
-
----
 
 #### 2019 — `EtwpCreateEtwThread` Stack Spoofing
 
@@ -435,16 +370,12 @@ When `EtwEventWrite` is called from a thread that has a certain `ThreadLocalStor
 **Impact:** Affects only the current thread effective for single-threaded tools, no code page modifications.  
 **Detection:** Unusual TLS flag values in non-ETW threads.
 
----
-
 #### 2020 — `EtwEventRegister` Callback Hook for Script Block Logging
 
 Specific to defeating PowerShell's Script Block Logging, researchers (including work published by FireEye's Red Team) identified that hooking or replacing the provider callback registered by the PowerShell ETW provider causes the callback to be skipped. Since the SBL mechanism calls `EtwEventWrite` via the registered provider's instrumented callback chain, inserting a no-op at this layer avoids the need to patch ntdll at all.
 
 **Impact:** Targeted and stealthy for PowerShell specifically.  
 **Detection:** Monitoring provider callback pointer integrity.
-
----
 
 #### 2021 — `ClrEtwAll` Flag Manipulation (.NET)
 
@@ -462,13 +393,9 @@ For suppressing .NET CLR ETW events specifically, Topher Timzen and others docum
 **Impact:** Specifically targets EDR detection of in-memory .NET loading (execute-assembly style attacks).  
 **Detection:** Memory scanning for the patched CLR internal configuration behavioral analysis showing .NET execution without CLR telemetry.
 
----
-
 ### Kernel-Mode Bypasses
 
 Kernel-mode bypasses are substantially more powerful and more dangerous. They require the attacker to have kernel code execution (typically via a vulnerable driver, a BYOD technique, or an existing kernel-mode implant). However, they are correspondingly harder to detect, as they operate below the level where user-mode security tools can observe them.
-
----
 
 #### 2015–2016 — `_ETW_LOGGER_CONTEXT` Buffer Manipulation
 
@@ -484,8 +411,6 @@ Early kernel ETW bypasses focused on corrupting the logger context structure to 
 **Impact:** Can target specific sessions, leaving others operational.  
 **Detection:** Kernel integrity monitors checking session buffer state, PatchGuard (KPP) on some structures.
 
----
-
 #### 2017 — Provider Enable Mask Clearing (Kernel Level)
 
 In kernel mode, the provider registration structures (`_ETW_REG_ENTRY` for kernel providers) are accessible directly. Clearing the `IsEnabled` bitmask in kernel provider registration entries suppresses events at the provider level, before any buffer interaction.
@@ -494,8 +419,6 @@ This technique was used in advanced implants to suppress `Microsoft-Windows-Kern
 
 **Impact:** Suppresses kernel provider events such as process creation, image loads the primary EDR telemetry sources.  
 **Detection:** Kernel scanning for zeroed provider enable masks in known provider registration entries. PatchGuard does not protect these fields on most Windows versions.
-
----
 
 #### 2018–2019 — `EtwThreatIntProvRegHandle` NULL-ing
 
@@ -516,8 +439,6 @@ PHANDLE pEtwThreatIntProvRegHandle = (PHANDLE)
 **Impact:** Disables the most privileged ETW security telemetry channel, blinding even PPL-protected security processes.  
 **Detection:** Checking `EtwThreatIntProvRegHandle` value at runtime; integrity checking of kernel symbol values. PatchGuard was NOT protecting this symbol at time of disclosure.
 
----
-
 #### 2020 — PatchGuard and ETW: Understanding the Boundary
 
 An important clarification in the bypass timeline: PatchGuard (Kernel Patch Protection, KPP) does NOT comprehensively protect ETW structures. KPP protects a specific set of kernel data structures (SSDT, IDT, GDT, kernel code sections), but the ETW provider registration structures, logger context structures, and most ETW-related global variables are not in KPP's protection set as of most Windows 10/11 versions.
@@ -525,8 +446,6 @@ An important clarification in the bypass timeline: PatchGuard (Kernel Patch Prot
 This means that kernel ETW manipulation is possible without triggering a KPP-induced BSOD, which is why kernel-mode ETW bypasses remained viable long after PatchGuard was introduced.
 
 **Kernel Data Protection (KDP)**, introduced in Windows 10 2004, does begin to protect some ETW structures by making them non-writable after initialization. The CKCL's logger context and the ETWTI registration handle gained KDP protection progressively across Windows versions, making the above bypasses non-functional on patched modern systems.
-
----
 
 #### 2022–2023 — Hypervisor-Protected Code Integrity (HVCI) Era
 
@@ -540,8 +459,6 @@ The BYOVD technique became the dominant approach for kernel ETW bypasses in this
 
 **Detection:** Vulnerable driver blocklists (WDAC/Driver Blocklist) monitoring for known-vulnerable driver loads via `Microsoft-Windows-Kernel-Process` image load events (ironically, the very telemetry these bypasses aim to suppress, so the window of visibility is narrow).
 
----
-
 #### 2023–2024 — ETW Bypass via Kernel Callback Removal
 
 Some modern kernel-mode implants bypass ETW indirectly by removing the kernel callbacks (`PsSetCreateProcessNotifyRoutine`, `PsSetLoadImageNotifyRoutine`) that certain ETW-based providers depend on. Disabling these callbacks prevents the callbacks from firing, which prevents the ETW provider from having data to emit — effectively a step removed from ETW itself.
@@ -549,8 +466,6 @@ Some modern kernel-mode implants bypass ETW indirectly by removing the kernel ca
 This is a notable evolution: rather than attacking ETW infrastructure directly (which draws more scrutiny), attack the data sources that feed ETW providers.
 
 **Detection:** Kernel callback integrity monitoring (verifying the expected set of registered callbacks matches a known-good baseline); this is a detection area that Microsoft continues to improve with each Windows release.
-
----
 
 ## Detecting ETW Tampering
 
@@ -630,8 +545,6 @@ Some of the most robust detections are behavioral rather than structural:
 | Callback removal | Missing expected notify callbacks | Callback list enumeration |
 | Session exhaustion | All 64/128 session slots in use | Session count monitoring |
 
----
-
 ## Defensive Recommendations
 
 For blue teams and defenders building ETW-based detection capabilities:
@@ -650,8 +563,6 @@ For blue teams and defenders building ETW-based detection capabilities:
 
 **7. Baseline expected ETW event rates.** Implement event volume anomaly detection. A machine running PowerShell scripts with zero 4104 (Script Block Logging) events is suspicious. Establish per-machine, per-process baselines and alert on significant deviations.
 
----
-
 ## Conclusion
 
 ETW is a microcosm of the broader Windows security landscape: deeply powerful, architecturally elegant, and the subject of a decade-long arms race between attackers seeking to blind it and defenders seeking to protect it. For offensive security practitioners, ETW represents both the primary risk surface (it will detect you) and a rich operational resource (you can consume its data for your own purposes).
@@ -667,8 +578,6 @@ The key takeaways from this deep dive:
 - **Detection is achievable but layered.** No single detection catches all bypass techniques. The most robust defensive posture combines memory integrity checking, behavioral anomaly detection on event volumes, kernel structure integrity monitoring, and redundant telemetry sources.
 
 As Microsoft continues to extend KDP coverage to more ETW structures and HVCI adoption grows, the kernel bypass surface will continue to shrink. Understanding the historical attack surface and its evolution is essential for both accurately assessing your current detection capabilities and anticipating where the next generation of bypasses will emerge.
-
----
 
 ### Further Reading and References
 
