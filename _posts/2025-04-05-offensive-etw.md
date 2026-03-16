@@ -58,7 +58,7 @@ ETW is built around three distinct roles that interact with the tracing infrastr
 
 **Consumers** are processes that read the event data. They can either read from a live session in real time using `OpenTrace` and `ProcessTrace`, or read from a log file (`.etl`) after the fact. The consumer registers an `EVENT_RECORD_CALLBACK` function that is invoked for each matching event.
 
-![etw](../assets/images/etwarchitecture.png)
+![etw](/assets/images/etwarchitecture.png)
 
 ### How Events Flow Through the Kernel
 
@@ -121,7 +121,7 @@ The quickest way to enumerate registered ETW providers on a live system is `logm
 logman query providers
 ```
 
-![logman](../assets/images/logman.png)
+![logman](/assets/images/logman.png)
 
 This queries `TdhEnumerateProviders` under the hood and lists every provider that has a registered manifest. For a more complete view including unregistered/TraceLogging providers currently active in running processes, you can use:
 
@@ -278,7 +278,7 @@ $source.Dynamic.All += { param($event)
 $source.Process()
 ```
 
-![hash](../assets/images/etw4.png)
+![hash](/assets/images/etw4.png)
 
 This is a stealthy complement to traditional responder-style attacks: no new network traffic, no injected packets, just passive observation of the existing authentication stream.
 
